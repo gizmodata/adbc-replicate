@@ -41,6 +41,19 @@ objects: [{db_schemas: [HR]}]
     assert config.target.password == "fallback"
 
 
+def test_config_file_is_read_as_utf8(tmp_path):
+    # Windows defaults to cp1252; a comment or name with non-ASCII text must still load.
+    path = tmp_path / "c.yaml"
+    path.write_bytes("""
+version: 1
+name: "Réplication 🚀 Müller"   # ✅
+source: {type: duckdb, path: /tmp/x.duckdb}
+target: {type: duckdb, path: /tmp/y.duckdb}
+objects: [{db_schemas: [main]}]
+""".encode())
+    assert load_config(path=path).name == "Réplication 🚀 Müller"
+
+
 def test_missing_env_var_fails_closed(monkeypatch):
     monkeypatch.delenv("NOPE", raising=False)
     with pytest.raises(ConfigError, match="NOPE"):

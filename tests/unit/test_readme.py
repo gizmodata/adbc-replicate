@@ -9,7 +9,7 @@ import yaml
 from adbc_replicate.config import parse_config
 
 README = Path(__file__).resolve().parents[2] / "README.md"
-BLOCKS = re.findall(r"```yaml\n(.*?)```", README.read_text(), flags=re.DOTALL)
+BLOCKS = re.findall(r"```yaml\n(.*?)```", README.read_text(encoding="utf-8"), flags=re.DOTALL)
 BASE = {
     "version": 1,
     "source": {"type": "oracle", "uri": "oracle://h:1521/S"},

@@ -329,7 +329,7 @@ def parse_config(data: dict, base_dir: Path | None = None) -> ReplicationConfig:
 def load_config(path: str | Path) -> ReplicationConfig:
     path = Path(path)
     try:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
     except OSError as e:
         raise ConfigError(f"can't read config {path}: {e}") from e
     try:

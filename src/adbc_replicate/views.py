@@ -158,5 +158,5 @@ def load_override(overrides_dir: str | None, db_schema: str, view: str) -> str |
     wanted = f"{db_schema}.{view}.sql".lower()
     for entry in os.listdir(overrides_dir):
         if entry.lower() == wanted:
-            return Path(overrides_dir, entry).read_text()
+            return Path(overrides_dir, entry).read_text(encoding="utf-8")
     return None

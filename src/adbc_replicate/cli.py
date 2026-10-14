@@ -294,7 +294,7 @@ def init(path) -> None:
     p = Path(path)
     if p.exists():
         _fail(message=f"{path} already exists")
-    p.write_text(EXAMPLE_CONFIG)
+    p.write_text(EXAMPLE_CONFIG, encoding="utf-8")
     click.echo(f"📝 Wrote {path}. Edit it, then: adbc-replicate plan -c {path}")
 
 
