@@ -210,16 +210,16 @@ def test_cli_validate_plan_and_run(paths, tmp_path):
     cfg = tmp_path / "replicate.yaml"
     cfg.write_text(yaml.safe_dump(make_config(paths=paths).model_dump(mode="json", exclude_none=True)))
     runner = CliRunner()
-    result = runner.invoke(main, ["validate", "-c", str(cfg)])
+    result = runner.invoke(main, ["validate", "--config", str(cfg)])
     assert result.exit_code == 0 and "valid" in result.output
-    result = runner.invoke(main, ["plan", "-c", str(cfg), "--format", "json"])
+    result = runner.invoke(main, ["plan", "--config", str(cfg), "--format", "json"])
     assert result.exit_code == 0, result.output
     plan = json.loads(result.output)
     assert {t["target"] for t in plan["tables"]} == {"hr.dept", "hr.employees"}
     assert {v["source"]: v["status"] for v in plan["views"]}["hr.v_emp"] == "translates"
-    result = runner.invoke(main, ["run", "-c", str(cfg), "--skip-views"])
+    result = runner.invoke(main, ["run", "--config", str(cfg), "--skip-views"])
     assert result.exit_code == 0, result.output
-    result = runner.invoke(main, ["run", "-c", str(cfg)])
+    result = runner.invoke(main, ["run", "--config", str(cfg)])
     assert result.exit_code == EXIT_VIEW_ERRORS, result.output       # v_orders can't be created
 
 
@@ -229,8 +229,9 @@ def test_cli_init_writes_a_valid_example(tmp_path, monkeypatch):
     path = tmp_path / "replicate.yaml"
     runner = CliRunner()
     assert runner.invoke(main, ["init", str(path)]).exit_code == 0
-    result = runner.invoke(main, ["validate", "-c", str(path)])
+    result = runner.invoke(main, ["validate", "--config", str(path)])
     assert result.exit_code == 0, result.output
+    assert runner.invoke(main, ["validate", "-c", str(path)]).exit_code == 0     # short alias still works
 
 
 def test_catalog_named_like_a_db_schema(paths, tmp_path):

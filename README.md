@@ -115,9 +115,9 @@ parallelism: 2
 ```bash
 export PGPASSWORD=postgres GIZMOSQL_PASSWORD=gizmosql
 
-adbc-replicate test-connection -c replicate.yaml
-adbc-replicate plan -c replicate.yaml
-adbc-replicate run -c replicate.yaml
+adbc-replicate test-connection --config replicate.yaml
+adbc-replicate plan --config replicate.yaml
+adbc-replicate run --config replicate.yaml
 ```
 
 ```text
@@ -201,13 +201,13 @@ Extras: `oracle`, `postgresql`, `snowflake`, `gizmosql`, `duckdb`, `all`. On Pyt
 | Command | What it does |
 |---|---|
 | `adbc-replicate init [PATH]` | Write a starter config. |
-| `adbc-replicate validate -c CONFIG` | Check a config without connecting to anything. |
-| `adbc-replicate test-connection -c CONFIG` | Connect to the source and target and report what each sees. |
-| `adbc-replicate plan -c CONFIG [--show-sql] [--format json]` | Show what a run would copy, the target names, excluded and masked columns, and whether each view translates. Connects to the source only. |
-| `adbc-replicate run -c CONFIG` | Replicate. Options: `--full-refresh`, `--row-limit N`, `--tables 'HR.EMP*'` (repeatable), `--parallelism N`, `--skip-views`, `--log-format json`, `--quiet`. |
+| `adbc-replicate validate --config CONFIG` | Check a config without connecting to anything. |
+| `adbc-replicate test-connection --config CONFIG` | Connect to the source and target and report what each sees. |
+| `adbc-replicate plan --config CONFIG [--show-sql] [--format json]` | Show what a run would copy, the target names, excluded and masked columns, and whether each view translates. Connects to the source only. |
+| `adbc-replicate run --config CONFIG` | Replicate. Options: `--full-refresh`, `--row-limit N`, `--tables 'HR.EMP*'` (repeatable), `--parallelism N`, `--skip-views`, `--log-format json`, `--quiet`. |
 | `adbc-replicate schema` | Print the config's JSON Schema. |
 
-`--env-file .env` (or `DOTENV_PATH`) loads environment variables first; existing variables win.
+`--config` has the short form `-c`, and `--quiet` has `-q`. `--env-file .env` (or `DOTENV_PATH`) loads environment variables first; existing variables win.
 
 **Exit codes:** `0` completed · `1` failed (a table failed, or the run couldn't start) ·
 `2` config or plan error (e.g. a mask rule that matches nothing) · `3` completed, but some

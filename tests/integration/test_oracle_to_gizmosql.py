@@ -185,7 +185,7 @@ def test_cli_typo_in_mask_rule_fails_before_copying(oracle, gizmosql, prefix, tm
                          columns=[{"tables": ["REPLICATE.EMP"], "mask": {"SNN": "hash"}}])
     path = tmp_path / "c.yaml"
     path.write_text(yaml.safe_dump(config.model_dump(mode="json", exclude_none=True)))
-    result = CliRunner().invoke(main, ["run", "-c", str(path), "--log-format", "json"])
+    result = CliRunner().invoke(main, ["run", "--config", str(path), "--log-format", "json"])
     assert result.exit_code == EXIT_CONFIG, result.output
     assert "SNN" in result.output
     assert query(conn=gizmosql, sql=f"SELECT count(*) FROM duckdb_tables() WHERE schema_name = '{prefix}_replicate'")[0][0] == 0
@@ -196,9 +196,9 @@ def test_cli_plan_and_test_connection(oracle, gizmosql, prefix, tmp_path):
     path = tmp_path / "c.yaml"
     path.write_text(yaml.safe_dump(config.model_dump(mode="json", exclude_none=True)))
     runner = CliRunner()
-    result = runner.invoke(main, ["test-connection", "-c", str(path)])
+    result = runner.invoke(main, ["test-connection", "--config", str(path)])
     assert result.exit_code == 0 and result.output.count("✅") == 2, result.output
-    result = runner.invoke(main, ["plan", "-c", str(path), "--format", "json"])
+    result = runner.invoke(main, ["plan", "--config", str(path), "--format", "json"])
     assert result.exit_code == 0, result.output
     plan = json.loads(result.output)
     assert {v["source"]: v["status"] for v in plan["views"]} == {

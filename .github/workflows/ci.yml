@@ -197,11 +197,11 @@ jobs:
           EOF
           for _ in 1 2 3 4 5 6; do
             docker run --rm --network host -v /tmp/replicate.yaml:/config/replicate.yaml:ro \
-              -e PGPASSWORD=postgres -e GZPASSWORD=gizmosql adbc-replicate:ci test-connection -c /config/replicate.yaml && break
+              -e PGPASSWORD=postgres -e GZPASSWORD=gizmosql adbc-replicate:ci test-connection --config /config/replicate.yaml && break
             sleep 5
           done
           docker run --rm --network host -v /tmp/replicate.yaml:/config/replicate.yaml:ro \
-            -e PGPASSWORD=postgres -e GZPASSWORD=gizmosql adbc-replicate:ci run -c /config/replicate.yaml
+            -e PGPASSWORD=postgres -e GZPASSWORD=gizmosql adbc-replicate:ci run --config /config/replicate.yaml
 
   helm:
     runs-on: ubuntu-latest
