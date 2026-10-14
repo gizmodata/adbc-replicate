@@ -50,13 +50,17 @@ like [Vaden Automotive](https://gizmodata.com/case-studies/vaden-automotive).
 **1. Start a PostgreSQL source and a GizmoSQL target, and add some data:**
 
 ```bash
-docker run -d --name replicate-demo-postgres -p 5433:5432 -e POSTGRES_PASSWORD=postgres postgres:16-alpine
+docker run --detach --name replicate-demo-postgres --publish 5433:5432 \
+  --env POSTGRES_PASSWORD=postgres postgres:16-alpine
 
-docker run -d --name replicate-demo-gizmosql -p 31338:31337 \
-  -e GIZMOSQL_USERNAME=gizmosql -e GIZMOSQL_PASSWORD=gizmosql -e TLS_ENABLED=0 \
-  -e DATABASE_FILENAME=/tmp/warehouse.duckdb gizmodata/gizmosql:latest
+docker run --detach --name replicate-demo-gizmosql --publish 31338:31337 \
+  --env GIZMOSQL_USERNAME=gizmosql --env GIZMOSQL_PASSWORD=gizmosql --env TLS_ENABLED=0 \
+  --env DATABASE_FILENAME=/tmp/warehouse.duckdb gizmodata/gizmosql:latest
 
-docker exec -i replicate-demo-postgres psql -q -U postgres <<'SQL'
+# wait until PostgreSQL accepts connections (TCP: the image's first-start init server is socket-only)
+until docker exec replicate-demo-postgres pg_isready --host=127.0.0.1 --quiet; do sleep 1; done
+
+docker exec --interactive replicate-demo-postgres psql --quiet --username=postgres <<'SQL'
 CREATE SCHEMA shop;
 CREATE TABLE shop.customers (id int PRIMARY KEY, name text, email text, ssn text);
 INSERT INTO shop.customers
@@ -173,17 +177,20 @@ with gizmosql.connect(uri="gizmosql://127.0.0.1:31338?transport=tcp", username="
     print(cur.fetchall())
     cur.execute(operation="SELECT name, total FROM shop.customer_totals ORDER BY total DESC LIMIT 3")
     print(cur.fetchall())
-    cur.execute(operation="SELECT status, tables_copied, rows_copied FROM _adbc_replicate.run_log")
+    cur.execute(operation="SELECT status, tables_copied, rows_copied FROM _adbc_replicate.run_log ORDER BY started_at")
     print(cur.fetchall())
 ```
 
 ```text
 [(1, 'Customer 1', 'ed8558a632ff0bd6474c36a8bd16cb1381af61b57534295a4eda9f8a9a4d6a8e'), (2, 'Customer 2', 'b9749b...'), ...]
 [('Customer 958', Decimal('30571.87')), ('Customer 581', Decimal('29955.40')), ('Customer 616', Decimal('29601.96'))]
-[('completed', 2, 101000)]
+[('completed', 2, 101000), ('completed', 0, 0)]
 ```
 
-Clean up with `docker rm -f replicate-demo-postgres replicate-demo-gizmosql`.
+The order amounts are random, so your totals will differ; `run_log` has a row per run (the
+first run, then the re-run that copied nothing).
+
+Clean up with `docker rm --force replicate-demo-postgres replicate-demo-gizmosql`.
 
 ## 📦 Installation
 
@@ -191,7 +198,7 @@ Clean up with `docker rm -f replicate-demo-postgres replicate-demo-gizmosql`.
 |---|---|
 | PyPI (Python 3.11 – 3.15) | `pip install "adbc-replicate[all]"` |
 | Container image (linux/amd64, linux/arm64) | `docker pull ghcr.io/gizmodata/adbc-replicate:latest` |
-| Helm chart (scheduled CronJob) | `helm install my-replication oci://ghcr.io/gizmodata/charts/adbc-replicate -f values.yaml` |
+| Helm chart (scheduled CronJob) | `helm install my-replication oci://ghcr.io/gizmodata/charts/adbc-replicate --values values.yaml` |
 
 Extras: `oracle`, `postgresql`, `snowflake`, `gizmosql`, `duckdb`, `all`. On Python 3.15,
 `all` leaves out `duckdb` until DuckDB publishes 3.15 wheels.
@@ -485,7 +492,7 @@ variables:
 kubectl create secret generic erp-replication-env \
   --from-literal=ORACLE_PASSWORD=... --from-literal=GIZMOSQL_PASSWORD=...
 
-helm install erp-replication oci://ghcr.io/gizmodata/charts/adbc-replicate -f values.yaml
+helm install erp-replication oci://ghcr.io/gizmodata/charts/adbc-replicate --values values.yaml
 ```
 
 ```yaml
@@ -536,10 +543,10 @@ A run that was killed before recording its result is marked `abandoned` by the n
 ```bash
 git clone https://github.com/gizmodata/adbc-replicate && cd adbc-replicate
 python -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
+pip install --editable ".[dev]"
 
 pytest tests/unit                          # fast, no servers (DuckDB → DuckDB)
-docker compose up -d --wait                # GizmoSQL, Oracle and PostgreSQL test servers
+docker compose up --detach --wait          # GizmoSQL, Oracle and PostgreSQL test servers
 pytest tests/integration -m integration    # real servers; an unreachable server FAILS, never skips
 ```
 
