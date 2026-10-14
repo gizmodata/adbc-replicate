@@ -109,6 +109,7 @@ _TRUNC_UNITS = {"DD": "day", "DDD": "day", "J": "day", "HH": "hour", "HH12": "ho
 # Older sqlglot versions (the floor is 27) lack some node classes; there those constructs parse as
 # plain columns and fail loudly in DuckDB instead.
 _SYSTIMESTAMP_NODES = tuple(c for c in (getattr(exp, "Systimestamp", None), getattr(exp, "Localtimestamp", None)) if c)
+_REGEXP_SUBSTR_NODES = tuple(c for c in (getattr(exp, "RegexpSubstr", None),) if c)
 _NOW_NODES = (exp.CurrentTimestamp, exp.CurrentDate, *_SYSTIMESTAMP_NODES)
 _DATE_RESULT_NODES = (exp.AddMonths, exp.LastDay, exp.StrToDate, exp.StrToTime, exp.DateTrunc,
                       *(c for c in (getattr(exp, "NextDay", None),) if c))
@@ -318,19 +319,26 @@ def _int_literal(node: exp.Expression | None, default: int) -> int | None:
     return int(node.this) if isinstance(node, exp.Literal) and node.is_int else None
 
 
-def _regexp_substr(node: exp.RegexpSubstr) -> exp.Expression | None:
-    if _int_literal(node=node.args.get("position"), default=1) != 1 \
-            or _int_literal(node=node.args.get("occurrence"), default=1) != 1:
+def _regexp_substr(node: exp.Expression) -> exp.Expression | None:
+    if isinstance(node, exp.Anonymous):     # older sqlglot: REGEXP_SUBSTR(s, p, position, occurrence, flags, group)
+        names = ("this", "expression", "position", "occurrence", "parameters", "group")
+        if not 2 <= len(node.expressions) <= len(names):
+            return None
+        args = dict(zip(names, node.expressions, strict=False))
+    else:
+        args = node.args
+    if _int_literal(node=args.get("position"), default=1) != 1 \
+            or _int_literal(node=args.get("occurrence"), default=1) != 1:
         return None
-    group = _int_literal(node=node.args.get("group"), default=0)
-    flags = node.args.get("parameters")
+    group = _int_literal(node=args.get("group"), default=0)
+    flags = args.get("parameters")
     if group is None or (flags is not None and not (isinstance(flags, exp.Literal) and flags.is_string
                                                     and set(flags.this) <= {"i", "c"})):
         return None
-    args = [node.this, node.expression, exp.Literal.number(group)]
+    extract = [args["this"], args["expression"], exp.Literal.number(group)]
     if flags is not None and "i" in flags.this and not flags.this.endswith("c"):   # the last of i/c wins
-        args.append(exp.Literal.string("i"))
-    return exp.func("NULLIF", exp.Anonymous(this="REGEXP_EXTRACT", expressions=args), exp.Literal.string(""))
+        extract.append(exp.Literal.string("i"))
+    return exp.func("NULLIF", exp.Anonymous(this="REGEXP_EXTRACT", expressions=extract), exp.Literal.string(""))
 
 
 # Oracle pseudo-columns: values only the source database can produce, with the type a NULL
@@ -364,7 +372,8 @@ def _oracle_rewrites(body: exp.Expression, pseudo_columns: str = "fail") -> exp.
 
     # REGEXP_SUBSTR(s, p [, 1, 1 [, 'i'|'c' [, group]]]) -> regexp_extract; Oracle's no-match is NULL.
     # (Both engines take the leftmost alternative that matches, checked against Oracle.)
-    for node in list(body.find_all(exp.RegexpSubstr)):
+    for node in [n for n in body.find_all(exp.Anonymous, *_REGEXP_SUBSTR_NODES)
+                 if not isinstance(n, exp.Anonymous) or n.name.upper() == "REGEXP_SUBSTR"]:
         replacement = _regexp_substr(node=node)
         if replacement is None:
             raise ViewTranslationError("REGEXP_SUBSTR with a position, occurrence or match option other than "
