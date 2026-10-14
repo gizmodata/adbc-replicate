@@ -21,6 +21,7 @@ from .planner import build_plan
 from .sources import make_source
 from .state import StateStore, column_signature
 from .targets import make_target
+from .targets.duckdb import is_transient
 from .views import ViewTranslationError, create_view_sql, load_override, translate_view
 
 EXIT_OK = 0
@@ -166,7 +167,7 @@ class Replicator:
 
             self.emit("table_started", f"  📦 Copying {name} → {task.target_db_schema}.{task.target_table} ({reason})",
                       table=name, target=f"{task.target_db_schema}.{task.target_table}", reason=reason)
-            rows = self._copy(task=task, sconn=sconn, tconn=tconn, exists_as_view=exists_as_view)
+            rows = self._copy_with_retries(task=task, sconn=sconn, tconn=tconn, exists_as_view=exists_as_view)
             return TableResult(task=task, action="copied", reason=reason, rows=rows, row_count=row_count,
                                fingerprint=fingerprint, seconds=time.monotonic() - started)
         except Exception as e:
@@ -176,6 +177,26 @@ class Replicator:
             hint = self.source.error_hint(error=error)
             return TableResult(task=task, action="failed", error=error + (f" — hint: {hint}" if hint else ""),
                                seconds=time.monotonic() - started)
+
+    def _copy_with_retries(self, task: TableTask, sconn, tconn, exists_as_view: bool) -> int:
+        """Re-run a load that failed on a transient connection error. Safe to repeat: the load is
+        one target transaction that replaces the table, and the source re-reads at the same snapshot."""
+        retries, wait = self.config.ingest.retries, self.config.ingest.retry_wait_seconds
+        for attempt in range(retries + 1):
+            try:
+                return self._copy(task=task, sconn=sconn, tconn=tconn, exists_as_view=exists_as_view)
+            except Exception as e:
+                if attempt == retries or not is_transient(error=e) or self._stop.is_set():
+                    raise
+                with suppress(Exception):
+                    tconn.rollback()
+                delay = wait * (2 ** attempt)
+                name = task.source.qualified_name
+                self.emit("table_retry", f"  🔁 {name}: {type(e).__name__}: {str(e).splitlines()[0]} — retrying in "
+                          f"{fmt_seconds(delay)} (attempt {attempt + 2} of {retries + 1})", level="warning",
+                          table=name, attempt=attempt + 2, error=f"{type(e).__name__}: {e}")
+                time.sleep(delay)
+        raise AssertionError("unreachable")
 
     def _copy(self, task: TableTask, sconn, tconn, exists_as_view: bool) -> int:
         name = task.source.qualified_name
@@ -297,7 +318,9 @@ class Replicator:
                     definition=definition, source_dialect=self.source.dialect,
                     view_db_schema=view.source.db_schema, target_db_schema=view.target_db_schema,
                     target_view=view.target_view, name_map=plan.name_map, case=self.config.naming.case,
-                    source_columns=[c.name for c in view.source.columns], target_catalog=self.target.catalog)
+                    source_columns=[c.name for c in view.source.columns], target_catalog=self.target.catalog,
+                    pseudo_columns=self.config.views.source_pseudo_columns,
+                    time_zone=self.config.views.source_time_zone, column_types=plan.column_types)
             except Exception as e:
                 failures[name] = f"translation: {e}"
 

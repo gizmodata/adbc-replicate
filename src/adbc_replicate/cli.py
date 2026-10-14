@@ -147,7 +147,10 @@ def plan(config_path, env_file, fmt, show_sql, only) -> None:
                                          view_db_schema=v.source.db_schema, target_db_schema=v.target_db_schema,
                                          target_view=v.target_view, name_map=the_plan.name_map,
                                          case=config.naming.case, source_columns=[c.name for c in v.source.columns],
-                                         target_catalog=config.target.catalog)
+                                         target_catalog=config.target.catalog,
+                                         pseudo_columns=config.views.source_pseudo_columns,
+                                         time_zone=config.views.source_time_zone,
+                                         column_types=the_plan.column_types)
                     entry["status"] = "translates"
                 if show_sql:
                     entry["sql"] = sql

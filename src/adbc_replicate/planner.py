@@ -13,7 +13,7 @@ class PlanError(Exception):
 
 
 class _ColumnRuleUsage:
-    """Tracks whether each exclude/include/mask pattern matched anything, to catch typos."""
+    """Tracks whether each exclude/include/mask/rename entry matched anything, to catch typos."""
 
     def __init__(self, rules: list[ColumnRule]) -> None:
         self.rules = rules
@@ -30,9 +30,10 @@ class _ColumnRuleUsage:
 
     def select(self, obj: SourceObject) -> tuple[list[SelectedColumn], list[str]]:
         names = [c.name for c in obj.columns]
-        included = set(names)
+        included = {c.name for c in obj.columns if not c.unsupported}
         masks = {}
         ignored = set()
+        renames: dict[str, str] = {}
         for i, rule in enumerate(self.compiled):
             if not rule["tables"].matches_table(schema=obj.db_schema, table=obj.name):
                 continue
@@ -59,8 +60,13 @@ class _ColumnRuleUsage:
                 if p is not None:
                     ignored.add(name)
                     self.matched.add((i, "fingerprint_ignore", p.text))
-        selected = [SelectedColumn(column=c, target_name=c.name, mask=masks.get(c.name),
-                                   fingerprint=c.name not in ignored)
+            for source_name, target_name in self.rules[i].rename.items():
+                for name in names:
+                    if name.upper() == source_name.upper():
+                        renames[name] = target_name
+                        self.matched.add((i, "rename", source_name))
+        selected = [SelectedColumn(column=c, target_name=renames.get(c.name, c.name), mask=masks.get(c.name),
+                                   fingerprint=c.name not in ignored, renamed=c.name in renames)
                     for c in obj.columns if c.name in included]
         excluded = [c.name for c in obj.columns if c.name not in included]
         return selected, excluded
@@ -69,7 +75,7 @@ class _ColumnRuleUsage:
         problems = []
         for i, rule in enumerate(self.rules):
             for kind, patterns in (("include", rule.include or []), ("exclude", rule.exclude),
-                                   ("mask", list(rule.mask))):
+                                   ("mask", list(rule.mask)), ("rename", list(rule.rename))):
                 for p in patterns:
                     if (i, kind, p) not in self.matched:
                         problems.append(f"columns[{i}].{kind} pattern {p!r} (tables {rule.tables}) "
@@ -144,10 +150,15 @@ def build_plan(config: ReplicationConfig, source, conn) -> Plan:
                              f"{winner[0].qualified_name} at {target_db_schema}.{target_name}")
 
     usage = _ColumnRuleUsage(rules=config.columns)
+    unsupported = [f"{obj.qualified_name}.{c.name} ({c.unsupported})"
+                   for obj, _, _, _ in by_target.values() for c in obj.columns if c.unsupported]
+    if unsupported:
+        plan.warnings.append("skipping columns that can't be copied: " + "; ".join(unsupported))
     for obj, role, target_db_schema, target_name in by_target.values():
         columns, excluded = usage.select(obj=obj)
         for c in columns:
-            c.target_name = apply_case(name=c.column.name, case=case)
+            if not c.renamed:
+                c.target_name = apply_case(name=c.column.name, case=case)
         target_names = [c.target_name for c in columns]
         if len(set(target_names)) != len(target_names):
             raise PlanError(f"{obj.qualified_name}: column names collide after naming.case={case!r}; "
@@ -180,4 +191,12 @@ def build_plan(config: ReplicationConfig, source, conn) -> Plan:
 
     plan.tables.sort(key=lambda t: (t.target_db_schema, t.target_table))
     plan.views.sort(key=lambda v: (v.target_db_schema, v.target_view))
+    for objects in object_cache.values():
+        for obj in objects:
+            plan.column_types[(obj.db_schema.upper(), obj.name.upper())] = {
+                c.name.upper(): c.data_type for c in obj.columns}
+    if plan.views and config.views.source_time_zone:
+        warning = source.time_zone_warning(conn=conn, time_zone=config.views.source_time_zone)
+        if warning:
+            plan.warnings.append(warning)
     return plan

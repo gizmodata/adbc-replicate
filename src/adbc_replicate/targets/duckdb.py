@@ -7,11 +7,28 @@ transaction, so readers keep seeing the previous copy of a table until the new o
 
 from __future__ import annotations
 
+import time
+
 import pyarrow as pa
 
 from ..config import DuckDBTarget as DuckDBConfig
 from ..config import GizmoSQLTarget as GizmoSQLConfig
 from ..sources.base import quote_ident
+
+
+def is_transient(error: BaseException | str) -> bool:
+    """A connection-level failure worth retrying: gRPC 'unavailable' (a proxy reload sends
+    GOAWAY, the server restarts, the network blips), as opposed to an error in the request."""
+    text = str(error)
+    return "(Unavailable;" in text or "connection is draining" in text or "GOAWAY" in text
+
+
+def _failed_before_running(error: BaseException) -> bool:
+    """True when a statement failed while being prepared, so it never ran and can be resent."""
+    return is_transient(error=error) and "Prepare)" in str(error)
+
+
+STATEMENT_RETRIES = 3
 
 
 class DuckDBFamilyTarget:
@@ -45,21 +62,28 @@ class DuckDBFamilyTarget:
     # ---- SQL helpers ----------------------------------------------------------------------
 
     @staticmethod
+    def _run(conn, sql: str, parameters: list | None, fetch: bool):
+        for attempt in range(STATEMENT_RETRIES + 1):
+            try:
+                with conn.cursor() as cur:
+                    if parameters is None:
+                        cur.execute(operation=sql)
+                    else:
+                        cur.execute(operation=sql, parameters=parameters)
+                    return cur.fetchall() if fetch else None
+            except Exception as e:
+                # Only a statement that never ran is resent; anything later may have executed.
+                if attempt == STATEMENT_RETRIES or not _failed_before_running(error=e):
+                    raise
+                time.sleep(2 ** attempt)
+
+    @staticmethod
     def execute(conn, sql: str, parameters: list | None = None) -> None:
-        with conn.cursor() as cur:
-            if parameters is None:
-                cur.execute(operation=sql)
-            else:
-                cur.execute(operation=sql, parameters=parameters)
+        DuckDBFamilyTarget._run(conn=conn, sql=sql, parameters=parameters, fetch=False)
 
     @staticmethod
     def query(conn, sql: str, parameters: list | None = None) -> list[tuple]:
-        with conn.cursor() as cur:
-            if parameters is None:
-                cur.execute(operation=sql)
-            else:
-                cur.execute(operation=sql, parameters=parameters)
-            return cur.fetchall()
+        return DuckDBFamilyTarget._run(conn=conn, sql=sql, parameters=parameters, fetch=True)
 
     def qualified(self, db_schema: str, name: str) -> str:
         parts = [db_schema, name]

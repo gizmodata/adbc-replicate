@@ -18,6 +18,7 @@ class Column:
     data_type: str                 # source type name, upper-case (NUMBER, VARCHAR2, numeric, ...)
     precision: int | None = None
     scale: int | None = None
+    unsupported: str | None = None # why this column can't be copied (it's skipped, and the plan says so)
 
 
 @dataclass
@@ -28,6 +29,7 @@ class SourceObject:
     kind: str                      # TABLE | VIEW | MATERIALIZED VIEW
     columns: list[Column] = field(default_factory=list)
     last_altered: datetime.datetime | None = None   # set only where it reliably tracks data changes
+    external: bool = False         # data lives outside the database (files): no snapshot reads
 
     @property
     def qualified_name(self) -> str:
@@ -40,6 +42,7 @@ class SelectedColumn:
     target_name: str
     mask: MaskSpec | None = None
     fingerprint: bool = True       # False: copied, but ignored by change detection
+    renamed: bool = False          # target_name came from a rename rule: naming.case doesn't apply
 
 
 @dataclass
@@ -76,6 +79,9 @@ class Plan:
     # (source db_schema, source name) upper-cased  ->  (target db_schema, target name), for every
     # object the run creates in the target; used to re-point table references inside views.
     name_map: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    # (source db_schema, name) upper-cased -> {column upper-cased: source data type}, for every
+    # discovered table and view; lets view translation tell a date from a number.
+    column_types: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass

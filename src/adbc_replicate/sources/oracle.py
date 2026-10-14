@@ -18,6 +18,11 @@ _HASHABLE_PREFIXES = ("NUMBER", "FLOAT", "BINARY_FLOAT", "BINARY_DOUBLE", "CHAR"
 _FINGERPRINT_GROUP = 150
 
 
+# Types adbc-driver-oracle can't read; such columns are skipped (and listed in the plan).
+_UNSUPPORTED_TYPES = {
+    "BFILE": "BFILE: a pointer to a file on the database server, not data",
+}
+
 class OracleSource(Source):
     dialect = "oracle"
     config: OracleConfig
@@ -61,6 +66,17 @@ class OracleSource(Source):
                 errors.append(f"{how}: {e}")
         raise RuntimeError("couldn't read the current SCN: " + "; ".join(errors))
 
+    def time_zone_warning(self, conn, time_zone: str) -> str | None:
+        import datetime
+        import zoneinfo
+        server = self.fetch_all(conn=conn, sql="SELECT TO_CHAR(SYSTIMESTAMP, 'TZH:TZM') FROM dual")[0][0]
+        offset = datetime.datetime.now(tz=zoneinfo.ZoneInfo(time_zone)).strftime("%z")
+        expected = f"{offset[:3]}:{offset[3:]}"
+        if server.strip() != expected:
+            return (f"views.source_time_zone {time_zone} is UTC{expected} now, but the Oracle server's clock is "
+                    f"UTC{server.strip()}: SYSDATE in translated views would be off")
+        return None
+
     def error_hint(self, error: str) -> str | None:
         if "ORA-01466" in error:
             return ("the table was created, altered or truncated after the snapshot SCN (or less than ~3 s "
@@ -84,11 +100,14 @@ class OracleSource(Source):
     def list_objects(self, conn, catalog: str | None, db_schemas: list[str]) -> list[SourceObject]:
         owners = in_list(values=db_schemas)
         objects: dict[tuple[str, str], SourceObject] = {}
-        for owner, name in self.fetch_all(conn=conn, sql=(
-                "SELECT owner, table_name FROM all_tables "
+        for owner, name, external in self.fetch_all(conn=conn, sql=(
+                "SELECT owner, table_name, external FROM all_tables "
                 f"WHERE owner IN ({owners}) AND nested = 'NO' AND secondary = 'N' AND temporary = 'N' "
                 "AND dropped = 'NO' AND (iot_type IS NULL OR iot_type = 'IOT')")):
-            objects[(owner, name)] = SourceObject(catalog=catalog, db_schema=owner, name=name, kind=TABLE)
+            if external == "YES" and self.config.external_tables == "exclude":
+                continue
+            objects[(owner, name)] = SourceObject(catalog=catalog, db_schema=owner, name=name, kind=TABLE,
+                                                  external=external == "YES")
         for owner, name in self.fetch_all(conn=conn, sql=(
                 f"SELECT owner, mview_name FROM all_mviews WHERE owner IN ({owners})")):
             objects[(owner, name)] = SourceObject(catalog=catalog, db_schema=owner, name=name, kind=MATERIALIZED_VIEW)
@@ -101,9 +120,11 @@ class OracleSource(Source):
                 f"WHERE owner IN ({owners}) ORDER BY owner, table_name, column_id")):
             obj = objects.get((owner, table))
             if obj is not None:
-                obj.columns.append(Column(name=column, data_type=(data_type or "").upper(),
+                data_type = (data_type or "").upper()
+                obj.columns.append(Column(name=column, data_type=data_type,
                                           precision=int(precision) if precision is not None else None,
-                                          scale=int(scale) if scale is not None else None))
+                                          scale=int(scale) if scale is not None else None,
+                                          unsupported=_UNSUPPORTED_TYPES.get(data_type)))
         return sorted(objects.values(), key=lambda o: (o.db_schema, o.name))
 
     def view_definitions(self, conn, catalog: str | None, views: list[SourceObject]) -> dict[tuple[str, str], str]:
@@ -117,7 +138,8 @@ class OracleSource(Source):
 
     def table_ref(self, obj: SourceObject) -> str:
         ref = f"{self.quote(name=obj.db_schema)}.{self.quote(name=obj.name)}"
-        if self.snapshot is not None:
+        # External tables read files, which have no SCN (AS OF fails with ORA-08188).
+        if self.snapshot is not None and not obj.external:
             ref += f" AS OF SCN {int(self.snapshot.token)}"
         return ref
 

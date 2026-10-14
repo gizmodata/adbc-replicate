@@ -61,6 +61,14 @@ class OracleSource(_SourceBase):
     )
 
 
+    external_tables: Literal["include", "exclude"] = Field(
+        default="include",
+        description="Oracle external tables (ORACLE_LOADER, ORACLE_DATAPUMP, ...) read files outside the "
+                    "database. include copies them like tables, read as they are now (files have no SCN, "
+                    "so consistency: snapshot can't apply to them); exclude leaves them out entirely.",
+    )
+
+
 class PostgresSource(_SourceBase):
     type: Literal["postgresql"]
     uri: str = Field(description="e.g. postgresql://host:5432/dbname")
@@ -197,6 +205,12 @@ class ColumnRule(_Model):
         default_factory=list,
         description="Columns copied but ignored by change detection (e.g. dbt run-metadata stamps).",
     )
+    rename: dict[str, str] = Field(
+        default_factory=dict,
+        description="Source column name (exact, case-insensitive) -> target column name, used as written "
+                    "(naming.case doesn't apply). For names the target can't take, e.g. DuckLake reserves "
+                    "row_id while data inlining is on. Views that use the old name are reported as failed.",
+    )
 
     @field_validator("mask", mode="before")
     @classmethod
@@ -226,6 +240,30 @@ class ViewsConfig(_Model):
         default="report",
         description="What to do with a view that can't be created: report it, or copy its data as a table.",
     )
+    source_time_zone: str | None = Field(
+        default=None,
+        description="IANA time zone of the source database's clock (e.g. America/New_York). Oracle views using "
+                    "SYSDATE, SYSTIMESTAMP or CURRENT_DATE get wall-clock time in this zone; without it, such "
+                    "views are reported instead of being translated with a guessed zone.",
+    )
+    source_pseudo_columns: Literal["fail", "null"] = Field(
+        default="fail",
+        description="Source-only pseudo-columns that mean nothing in a copy (Oracle ORA_ROWSCN, ROWID), as used "
+                    "by APEX views for optimistic locking. fail: report such views. null: keep the column, "
+                    "filled with a typed NULL.",
+    )
+
+
+    @field_validator("source_time_zone")
+    @classmethod
+    def _known_time_zone(cls, value: str | None) -> str | None:
+        if value is not None:
+            import zoneinfo
+            try:
+                zoneinfo.ZoneInfo(value)
+            except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:
+                raise ValueError(f"unknown time zone {value!r} (use an IANA name such as America/New_York)") from e
+        return value
 
 
 class RefreshConfig(_Model):
@@ -245,6 +283,13 @@ class IngestConfig(_Model):
                     "pre-sized for 2,048 rows, so many tiny batches cost the server several times the "
                     "data; 12 MiB keeps the client's driver memory modest too.",
     )
+    retries: int = Field(
+        default=2, ge=0,
+        description="Re-load a table this many times after a transient connection error (gRPC "
+                    "'unavailable', e.g. 'the connection is draining' when a proxy in front of "
+                    "GizmoSQL reloads). Safe: a load is one transaction that replaces the table.",
+    )
+    retry_wait_seconds: float = Field(default=5.0, ge=0, description="Wait before the first retry; doubles each time.")
 
 
 class StateConfig(_Model):

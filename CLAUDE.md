@@ -64,5 +64,15 @@ charts/adbc-replicate             Helm CronJob
 - Snowflake shared (imported) databases have no time travel: `AT(TIMESTAMP => …)` fails with
   000707 on every table (found on SNOWFLAKE_SAMPLE_DATA), so the plan refuses snapshot mode
   there (`INFORMATION_SCHEMA.DATABASES.TYPE = 'IMPORTED DATABASE'`).
+- sqlglot (Oracle → DuckDB) silently: drops unsupported arguments unless generated with
+  `unsupported_level=RAISE`; maps `CAST(x AS DATE)` to DuckDB `DATE` (Oracle DATE has a time:
+  use `TIMESTAMP_S`); maps `SYSDATE` to UTC (it's the server's wall clock — often not UTC, e.g. US
+  Eastern); passes Oracle `TRUNC` units ('DD') and unknown functions through unchanged (those
+  fail loudly in DuckDB). views.py rewrites or refuses each; rewrites of Oracle functions are
+  compared with real Oracle in `tests/integration/test_oracle_view_functions.py` — extend it
+  with every new rewrite.
+- GizmoSQL behind nginx: long DuckDB error texts (DuckLake commit failures, view binder errors
+  quoting the whole statement) arrive as `RST_STREAM INTERNAL_ERROR` instead of the message.
+  Reproduce against a local DuckDB file target (`--row-limit 0`, schema only) to read them.
 - The Snowflake CI user (`ADBC_REPLICATE_CI`) has only PUBLIC: it can read the sample share and
   use SNOWFLAKE_LEARNING_WH, nothing else. Snowflake tests must stay read-only.

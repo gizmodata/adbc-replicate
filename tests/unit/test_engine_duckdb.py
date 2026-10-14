@@ -253,3 +253,87 @@ def test_reporter_survives_a_closed_pipe():
     reporter = Reporter(fmt="text", stream=Closed())
     reporter.emit(event="x", text="hello")
     reporter.emit(event="y", text="still fine")
+
+
+DRAINING = "IO: [GizmoSQL] [FlightSQL] the connection is draining (Unavailable; ExecuteIngest). Vendor code: 14"
+
+
+def test_transient_ingest_error_is_retried(paths, monkeypatch):
+    from adbc_replicate.targets.duckdb import DuckDBFamilyTarget
+    real_ingest = DuckDBFamilyTarget.ingest
+    failures = {"hr.employees": 1}
+
+    def flaky_ingest(self, conn, db_schema, table, reader):
+        if failures.get(f"{db_schema}.{table}", 0):
+            failures[f"{db_schema}.{table}"] -= 1
+            reader.read_all()                      # the upload happened, then the proxy dropped it
+            raise RuntimeError(DRAINING)
+        return real_ingest(self, conn=conn, db_schema=db_schema, table=table, reader=reader)
+
+    monkeypatch.setattr(DuckDBFamilyTarget, "ingest", flaky_ingest)
+    summary, out = run(config=make_config(paths=paths, ingest={"retry_wait_seconds": 0}), skip_views=True)
+    assert summary.exit_code == EXIT_OK, out
+    assert "🔁 hr.employees" in out and "attempt 2 of 3" in out
+    assert target_query(paths=paths, sql="SELECT count(*) FROM hr.employees")[0][0] == 500
+
+
+def test_non_transient_ingest_error_is_not_retried(paths, monkeypatch):
+    from adbc_replicate.targets.duckdb import DuckDBFamilyTarget
+    calls = []
+
+    def broken_ingest(self, conn, db_schema, table, reader):
+        calls.append(table)
+        raise RuntimeError("413 Request Entity Too Large (Unknown; ExecuteIngest)")
+
+    monkeypatch.setattr(DuckDBFamilyTarget, "ingest", broken_ingest)
+    summary, out = run(config=make_config(paths=paths, ingest={"retry_wait_seconds": 0}), skip_views=True)
+    assert summary.exit_code == EXIT_FAILED and "🔁" not in out
+    assert len(calls) == 1                         # aborted after the first table, never retried
+
+
+def test_statement_retried_only_when_it_never_ran(monkeypatch):
+    from adbc_replicate.targets import duckdb as target_mod
+    monkeypatch.setattr(target_mod.time, "sleep", lambda s: None)
+
+    class FakeCursor:
+        def __init__(self, errors):
+            self.errors = errors
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def execute(self, operation, parameters=None):
+            if self.errors:
+                raise RuntimeError(self.errors.pop(0))
+        def fetchall(self):
+            return [(1,)]
+
+    class FakeConn:
+        def __init__(self, errors):
+            self.errors = list(errors)
+        def cursor(self):
+            return FakeCursor(errors=self.errors)
+
+    prepare = "the connection is draining (Unavailable; Prepare). Vendor code: 14"
+    assert target_mod.DuckDBFamilyTarget.query(conn=FakeConn(errors=[prepare, prepare]), sql="SELECT 1") == [(1,)]
+    executed = "the connection is draining (Unavailable; ExecuteUpdate). Vendor code: 14"
+    with pytest.raises(RuntimeError, match="ExecuteUpdate"):     # may have run: never resent
+        target_mod.DuckDBFamilyTarget.execute(conn=FakeConn(errors=[executed]), sql="INSERT ...")
+
+
+def test_rename_columns(paths):
+    config = make_config(paths=paths, columns=[
+        {"tables": ["hr.employees"], "exclude": ["notes"], "mask": {"ssn": {"strategy": "hash", "salt": "pepper"}},
+         "rename": {"NAME": "employee_name", "ssn": "SSN_Hash"}}])
+    summary, out = run(config=config, skip_views=True)
+    assert summary.exit_code == EXIT_OK, out
+    cols = [r[0] for r in target_query(paths=paths, sql="DESCRIBE hr.employees")]
+    assert "employee_name" in cols and "SSN_Hash" in cols and "name" not in cols and "ssn" not in cols
+    # the mask still applies to the renamed column
+    assert target_query(paths=paths, sql='SELECT count(*) FROM hr.employees WHERE "SSN_Hash" LIKE \'123-%\'')[0][0] == 0
+
+
+def test_rename_of_a_missing_column_fails_the_plan(paths):
+    config = make_config(paths=paths, columns=[{"tables": ["hr.employees"], "rename": {"NAEM": "x"}}])
+    with pytest.raises(PlanError, match=r"columns\[0\]\.rename pattern 'NAEM'"):
+        run(config=config)

@@ -164,6 +164,10 @@ class Source(ABC):
         lossy or awkward form."""
         return {}
 
+    def time_zone_warning(self, conn, time_zone: str) -> str | None:
+        """A warning when views.source_time_zone doesn't match the source's clock (sources that can tell)."""
+        return None
+
     def error_hint(self, error: str) -> str | None:
         """A short explanation to append to a table failure, for errors with a known cause."""
         return None

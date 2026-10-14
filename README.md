@@ -264,7 +264,7 @@ would land on the same target name, a copied **table** wins over a view — usef
 replacing a view with a table copied from elsewhere; references to the replaced object
 inside other views are re-pointed automatically.
 
-### Columns: exclude, allow-list, mask
+### Columns: exclude, allow-list, mask, rename
 
 ```yaml
 columns:
@@ -280,6 +280,8 @@ columns:
     include: [ID, EMPLOYEE_ID, SCANNED_AT]   # allow-list: nothing else is copied
   - tables: ["*"]
     fingerprint_ignore: [DBT_INVOCATION_ID, DBT_RUN_STARTED_AT]   # copied, but not "a change"
+  - tables: [ERP.QUOTE_LINES]
+    rename: {ROW_ID: source_row_id}  # exact source name -> target name, used as written
 ```
 
 Every mask is evaluated **in the source database** as part of the SELECT, so the raw value
@@ -287,7 +289,13 @@ never leaves it. `expression` masks are written in the *source's* SQL dialect; `
 is replaced by the quoted column name. A view that references an excluded column fails to
 create (and is reported) rather than exposing it.
 
-**Typos fail closed:** if an `exclude`, `include` or `mask` pattern matches no column of
+`rename` is for names the target can't take: a DuckLake catalog reserves `row_id`,
+`begin_snapshot` and `end_snapshot` while data inlining is on, and on a PostgreSQL metadata
+catalog names such as `session_user` and `current_date` currently fail
+([duckdb/ducklake#1779](https://github.com/duckdb/ducklake/issues/1779)). Views that use a
+renamed column's old name are reported as failed.
+
+**Typos fail closed:** if an `exclude`, `include`, `mask` or `rename` entry matches no column of
 any selected table, the run stops before copying anything:
 
 ```text
@@ -332,9 +340,15 @@ the new one commits.
 Views are recreated in the target after the tables, in DuckDB SQL:
 
 - definitions are read from the source catalog and translated with sqlglot; Oracle `(+)`
-  joins become `LEFT JOIN`s, `FROM DUAL` is dropped, `WHERE ROWNUM <= n` becomes `LIMIT n`,
-  and constructs with no faithful translation (e.g. `CONNECT BY`) are reported, never
-  silently changed;
+  joins become `LEFT JOIN`s, `OUTER/CROSS APPLY` become lateral joins, `FROM DUAL` is dropped,
+  `WHERE ROWNUM <= n` becomes `LIMIT n`, and constructs with no faithful translation (e.g.
+  `CONNECT BY`, PL/SQL functions) are reported, never silently changed;
+- Oracle date semantics are kept: `CAST(x AS DATE)` keeps the time of day, `TRUNC(date)` and
+  `TRUNC(date, 'MM')` become `DATE_TRUNC`, and `TO_CHAR` formats with an exact DuckDB
+  equivalent (`YYYYMMDD`, `HH24:MI`, `DAY`, `fm0000000`, `fm999,990`, ...) are rewritten; the
+  rewrites are checked value by value against Oracle in the integration tests;
+- `SYSDATE`, `SYSTIMESTAMP` and `CURRENT_DATE` are the source server's wall-clock time, so they
+  need `views.source_time_zone`; the plan warns if it doesn't match the server's clock;
 - unqualified table references are qualified with the view's db_schema, references to
   replicated objects are re-pointed at their target names, and identifiers follow
   `naming.case`;
@@ -345,7 +359,12 @@ Views are recreated in the target after the tables, in DuckDB SQL:
 views:
   overrides_dir: ./view-overrides    # <DB_SCHEMA>.<VIEW>.sql: your own DuckDB SELECT, used instead
   on_failure: materialize            # or: report (default)
+  source_time_zone: America/New_York # the source's clock, for SYSDATE & co (Oracle)
+  source_pseudo_columns: "null"      # Oracle ORA_ROWSCN / ROWID in views: fail (default) | null
 ```
+
+A view that calls a source-only function (PL/SQL, `SYS_CONTEXT`) can't be translated; list it
+in `objects[].materialize_views` to copy its rows instead (column rules still apply).
 
 ### Everything else
 
@@ -377,6 +396,7 @@ source:
   password: ${ORACLE_PASSWORD}
   consistency: serializable
   unconstrained_number: decimal      # decimal (default) | double | string
+  external_tables: include           # include (default) | exclude
   options:
     adbc.oracle.nne: required        # Native Network Encryption, fail closed
 target:
@@ -394,6 +414,12 @@ objects:
   `NUMBER(p,s)` keeps its exact precision; `DATE` becomes `TIMESTAMP`; LOBs stream inline.
 - The user needs `SELECT` on what it replicates (plus `FLASHBACK` and `DBMS_FLASHBACK` for
   `consistency: snapshot`). It reads `ALL_TABLES`, `ALL_VIEWS`, `ALL_MVIEWS` and `ALL_TAB_COLUMNS`.
+- Global temporary tables are skipped (their rows are private to the session that wrote
+  them). External tables are copied like tables but read as they are now, since files have no
+  SCN; `external_tables: exclude` leaves them out. `BFILE` columns (pointers to files on the
+  database server) can't be read and are skipped; the plan lists them.
+- On 23ai and later, `GRANT SELECT ANY TABLE ON SCHEMA ERP` and `GRANT FLASHBACK ANY TABLE ON
+  SCHEMA ERP` cover every current and future table in a schema.
 - Any `adbc.oracle.*` driver option (TLS, wallets, NNE, batch sizes) goes in `options`.
 </details>
 
