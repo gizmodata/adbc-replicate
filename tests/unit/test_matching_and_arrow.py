@@ -42,7 +42,6 @@ def test_coalesce_respects_both_caps():
     assert all(b.nbytes <= 200 for b in out) and sum(b.num_rows for b in out) == 100
 
 
-@pytest.mark.skipif(not hasattr(pa, "json_"), reason="canonical arrow.json type needs pyarrow >= 19")
 def test_transform_renames_strips_extensions_widens_and_casts():
     schema = pa.schema([pa.field("ID", pa.string()), pa.field("TS", pa.timestamp(unit="s")),
                         pa.field("J", pa.json_(pa.string()))])

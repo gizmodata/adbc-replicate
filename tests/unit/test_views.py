@@ -94,8 +94,7 @@ def test_catalog_qualifies_only_ambiguous_names():
     "SELECT TO_NUMBER(s, '999D99') AS n FROM emp",
 ])
 def test_constructs_sqlglot_would_silently_change_are_refused(definition):
-    # refused either way: older sqlglot can't parse some of these at all
-    with pytest.raises(ViewTranslationError, match=r"no faithful DuckDB translation|can't parse"):
+    with pytest.raises(ViewTranslationError, match="no faithful DuckDB translation"):
         tr(definition=definition)
 
 

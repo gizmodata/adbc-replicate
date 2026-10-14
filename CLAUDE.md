@@ -34,7 +34,9 @@ charts/adbc-replicate             Helm CronJob
 - ADBC vocabulary everywhere (catalog, db_schema, table) — never Oracle-specific terms.
 - Keyword arguments at call sites (also for pyarrow/ADBC calls that accept them).
 - Python floor 3.11; CI matrix 3.11–3.14 + a 3.15 job (DuckDB has no 3.15 wheels yet, so the
-  `all` extra skips it there). The lowest-dependencies CI job keeps pyproject floors honest.
+  `all` extra skips it there). Dependency floors are the latest releases (the tool gets its own
+  venv/container): raise them when bumping rather than adding compatibility code. The
+  lowest-dependencies CI job installs exactly the floors.
 - Tests read only `ADBC_REPLICATE_TEST_*` variables: developer shells export real
   `GIZMOSQL_*` credentials. Docker addresses are `127.0.0.1`, never `localhost`.
 - Integration tests FAIL (never skip) when a server is unreachable.

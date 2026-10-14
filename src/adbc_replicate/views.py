@@ -14,9 +14,9 @@ from sqlglot.optimizer.qualify_tables import qualify_tables
 
 from .matching import apply_case
 
-# sqlglot renamed Select's "from" argument to "from_" in newer releases.
-_FROM = "from_" if "from_" in exp.Select.arg_types else "from"
-_WITH = "with_" if "with_" in exp.Select.arg_types else "with"
+# sqlglot's Select keeps its FROM and WITH clauses under these argument names.
+_FROM = "from_"
+_WITH = "with_"
 
 
 class ViewTranslationError(Exception):
@@ -106,13 +106,9 @@ _TRUNC_UNITS = {"DD": "day", "DDD": "day", "J": "day", "HH": "hour", "HH12": "ho
                 "MI": "minute", "MM": "month", "MON": "month", "MONTH": "month", "RM": "month", "Q": "quarter",
                 "YYYY": "year", "YYY": "year", "YY": "year", "Y": "year", "YEAR": "year", "SYYYY": "year",
                 "SYEAR": "year", "IW": "week"}
-# Older sqlglot versions (the floor is 27) lack some node classes; there those constructs parse as
-# plain columns and fail loudly in DuckDB instead.
-_SYSTIMESTAMP_NODES = tuple(c for c in (getattr(exp, "Systimestamp", None), getattr(exp, "Localtimestamp", None)) if c)
-_REGEXP_SUBSTR_NODES = tuple(c for c in (getattr(exp, "RegexpSubstr", None),) if c)
+_SYSTIMESTAMP_NODES = (exp.Systimestamp, exp.Localtimestamp)
 _NOW_NODES = (exp.CurrentTimestamp, exp.CurrentDate, *_SYSTIMESTAMP_NODES)
-_DATE_RESULT_NODES = (exp.AddMonths, exp.LastDay, exp.StrToDate, exp.StrToTime, exp.DateTrunc,
-                      *(c for c in (getattr(exp, "NextDay", None),) if c))
+_DATE_RESULT_NODES = (exp.AddMonths, exp.LastDay, exp.NextDay, exp.StrToDate, exp.StrToTime, exp.DateTrunc)
 _DATE_TYPES = (exp.DataType.Type.DATE, exp.DataType.Type.TIMESTAMP, exp.DataType.Type.TIMESTAMP_S,
                exp.DataType.Type.TIMESTAMPTZ, exp.DataType.Type.TIMESTAMPLTZ)
 
@@ -319,14 +315,8 @@ def _int_literal(node: exp.Expression | None, default: int) -> int | None:
     return int(node.this) if isinstance(node, exp.Literal) and node.is_int else None
 
 
-def _regexp_substr(node: exp.Expression) -> exp.Expression | None:
-    if isinstance(node, exp.Anonymous):     # older sqlglot: REGEXP_SUBSTR(s, p, position, occurrence, flags, group)
-        names = ("this", "expression", "position", "occurrence", "parameters", "group")
-        if not 2 <= len(node.expressions) <= len(names):
-            return None
-        args = dict(zip(names, node.expressions, strict=False))
-    else:
-        args = node.args
+def _regexp_substr(node: exp.RegexpSubstr) -> exp.Expression | None:
+    args = node.args
     if _int_literal(node=args.get("position"), default=1) != 1 \
             or _int_literal(node=args.get("occurrence"), default=1) != 1:
         return None
@@ -372,8 +362,7 @@ def _oracle_rewrites(body: exp.Expression, pseudo_columns: str = "fail") -> exp.
 
     # REGEXP_SUBSTR(s, p [, 1, 1 [, 'i'|'c' [, group]]]) -> regexp_extract; Oracle's no-match is NULL.
     # (Both engines take the leftmost alternative that matches, checked against Oracle.)
-    for node in [n for n in body.find_all(exp.Anonymous, *_REGEXP_SUBSTR_NODES)
-                 if not isinstance(n, exp.Anonymous) or n.name.upper() == "REGEXP_SUBSTR"]:
+    for node in list(body.find_all(exp.RegexpSubstr)):
         replacement = _regexp_substr(node=node)
         if replacement is None:
             raise ViewTranslationError("REGEXP_SUBSTR with a position, occurrence or match option other than "

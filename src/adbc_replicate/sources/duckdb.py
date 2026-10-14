@@ -18,9 +18,8 @@ def duckdb_connect(path: str, read_only: bool = False):
     kwargs = {"path": path} if path and path != ":memory:" else {}
     if read_only:
         kwargs["access_mode"] = "READ_ONLY"
-    # driver_path() is public from DuckDB 1.3; older releases only have the private helper.
-    driver_path = getattr(adbc_driver_duckdb, "driver_path", None) or adbc_driver_duckdb._driver_path
-    db = adbc_driver_manager.AdbcDatabase(driver=driver_path(), entrypoint="duckdb_adbc_init", **kwargs)
+    db = adbc_driver_manager.AdbcDatabase(driver=adbc_driver_duckdb.driver_path(), entrypoint="duckdb_adbc_init",
+                                          **kwargs)
     conn = adbc_driver_manager.AdbcConnection(db)
     return adbc_driver_manager.dbapi.Connection(db=db, conn=conn, autocommit=False)
 

@@ -40,8 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- sqlglot floor raised from 27.0 to 29.0 (older releases parse Oracle `SYSTIMESTAMP`, `TRUNC`
-  and `APPLY` differently).
+- Every dependency floor is now its latest release (pyarrow 26, sqlglot 30.22, pydantic 2.14,
+  adbc-driver-manager 1.12, ...): the tool runs in its own environment, and older sqlglot
+  releases parse Oracle `SYSTIMESTAMP`, `TRUNC`, `APPLY` and `REGEXP_SUBSTR` differently.
+  Compatibility code for older releases is gone.
 - Oracle date arithmetic in views follows Oracle: `DATE ± n` is n days later or earlier,
   rounded to the second (a `TIMESTAMP` is truncated to the second first), and `DATE - DATE`
   is a number of days (a DOUBLE, where Oracle's is a 38-digit NUMBER). Operand types come
