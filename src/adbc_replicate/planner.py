@@ -83,6 +83,22 @@ class _ColumnRuleUsage:
         return problems
 
 
+def _incremental_key(task: TableTask) -> tuple[list[str] | None, str | None]:
+    """The target column names to merge on, or why the table is copied whole instead."""
+    key = task.source.primary_key
+    if not key:
+        return None, "no primary key"
+    selected = {c.column.name: c for c in task.columns}
+    for name in key:
+        column = selected.get(name)
+        if column is None:
+            return None, f"primary-key column {name} is excluded"
+        if column.mask is not None and column.mask.strategy != "hash":
+            # null and redact make keys collide; an expression may too. A salted hash stays unique.
+            return None, f"primary-key column {name} is masked ({column.mask.strategy})"
+    return [selected[name].target_name for name in key], None
+
+
 def build_plan(config: ReplicationConfig, source, conn) -> Plan:
     case = config.naming.case
     plan = Plan(tables=[], views=[])
@@ -105,6 +121,10 @@ def build_plan(config: ReplicationConfig, source, conn) -> Plan:
         key = (rule.catalog, tuple(db_schemas))
         if key not in object_cache:
             object_cache[key] = source.list_objects(conn=conn, catalog=rule.catalog, db_schemas=db_schemas)
+            if config.refresh.mode == "incremental":
+                keys = source.primary_keys(conn=conn, catalog=rule.catalog, db_schemas=db_schemas)
+                for obj in object_cache[key]:
+                    obj.primary_key = keys.get((obj.db_schema, obj.name))
 
         tables, exclude_tables = PatternSet(patterns=rule.tables), PatternSet(patterns=rule.exclude_tables)
         views, exclude_views = PatternSet(patterns=rule.views), PatternSet(patterns=rule.exclude_views)
@@ -177,8 +197,11 @@ def build_plan(config: ReplicationConfig, source, conn) -> Plan:
                 plan.warnings.append(f"skipping {obj.qualified_name}: every column is excluded")
                 continue
             note = "view materialized as a table" if role == "materialize" else None
-            plan.tables.append(TableTask(source=obj, target_db_schema=target_db_schema, target_table=target_name,
-                                         columns=columns, excluded_columns=excluded, note=note))
+            task = TableTask(source=obj, target_db_schema=target_db_schema, target_table=target_name,
+                             columns=columns, excluded_columns=excluded, note=note)
+            if config.refresh.mode == "incremental":
+                task.incremental_key, task.incremental_note = _incremental_key(task=task)
+            plan.tables.append(task)
         plan.name_map[(obj.db_schema.upper(), obj.name.upper())] = (target_db_schema, target_name)
 
     problems = usage.unmatched()

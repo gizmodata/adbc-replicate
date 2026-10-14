@@ -55,8 +55,11 @@ class StateStore:
                 column_signature  VARCHAR,
                 last_copied_at    TIMESTAMPTZ,
                 last_checked_at   TIMESTAMPTZ,
-                last_run_id       VARCHAR
+                last_run_id       VARCHAR,
+                change_token      VARCHAR
             )""")
+        # added in 0.3 (incremental loads): state tables from older versions get the column
+        self._exec(f"ALTER TABLE {s}.table_state ADD COLUMN IF NOT EXISTS change_token VARCHAR")
         self._exec(f"""
             CREATE TABLE IF NOT EXISTS {s}.view_state (
                 db_schema_name    VARCHAR NOT NULL,
@@ -107,13 +110,13 @@ class StateStore:
 
     def load_tables(self) -> dict[tuple[str, str], dict]:
         rows = self._query(f"SELECT db_schema_name, table_name, change_marker, fingerprint, row_count, "
-                           f"column_signature FROM {self.s}.table_state")
+                           f"column_signature, change_token FROM {self.s}.table_state")
         self.conn.commit()
         return {(r[0], r[1]): {"change_marker": to_utc(ts=r[2]), "fingerprint": r[3], "row_count": r[4],
-                               "column_signature": r[5]} for r in rows}
+                               "column_signature": r[5], "change_token": r[6]} for r in rows}
 
     def save_table(self, task, change_marker, fingerprint: str | None, row_count: int | None,
-                   column_signature: str, copied: bool, run_id: str) -> None:
+                   column_signature: str, copied: bool, run_id: str, change_token: str | None = None) -> None:
         """Upsert one table's state (DELETE + INSERT: no key index needed on the state table)."""
         db_schema, table = task.target_key
         now = utc_now()
@@ -122,10 +125,13 @@ class StateStore:
         last_copied_at = now if copied else (to_utc(ts=previous[0][0]) if previous else None)
         self._exec(f"DELETE FROM {self.s}.table_state WHERE db_schema_name = ? AND table_name = ?",
                    [db_schema, table])
-        self._exec(f"INSERT INTO {self.s}.table_state VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        self._exec(f"INSERT INTO {self.s}.table_state (db_schema_name, table_name, source_catalog, "
+                   "source_db_schema, source_table, source_kind, change_marker, fingerprint, row_count, "
+                   "column_signature, last_copied_at, last_checked_at, last_run_id, change_token) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                    [db_schema, table, task.source.catalog, task.source.db_schema, task.source.name,
                     task.source.kind, to_utc(ts=change_marker), fingerprint, row_count, column_signature,
-                    last_copied_at, now, run_id])
+                    last_copied_at, now, run_id, change_token])
         self.conn.commit()
 
     def forget_table(self, db_schema: str, table: str) -> None:

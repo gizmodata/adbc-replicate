@@ -267,11 +267,19 @@ class ViewsConfig(_Model):
 
 
 class RefreshConfig(_Model):
-    mode: Literal["changed", "full"] = Field(
+    mode: Literal["changed", "full", "incremental"] = Field(
         default="changed",
         description="changed: skip tables whose content is unchanged since the last run (metadata "
                     "timestamp where the source has one, else a COUNT + content fingerprint computed in "
-                    "the source). full: copy every table on every run.",
+                    "the source). full: copy every table on every run. incremental: like changed, but a "
+                    "table with a primary key (from the driver's catalog metadata) gets only the rows "
+                    "changed since the last run, merged on the key, where the source can tell which rows "
+                    "changed (Oracle: ORA_ROWSCN, needs consistency: snapshot).",
+    )
+    detect_deletes: bool = Field(
+        default=True,
+        description="incremental: also delete target rows whose key no longer exists in the source "
+                    "(reads the source's key column(s) each run).",
     )
 
 

@@ -142,9 +142,11 @@ class Source(ABC):
     def limit_clause(self, row_limit: int) -> str:
         return f" LIMIT {int(row_limit)}"
 
-    def select_sql(self, task: TableTask, row_limit: int | None = None) -> str:
+    def select_sql(self, task: TableTask, row_limit: int | None = None, where: str | None = None) -> str:
         exprs = ", ".join(self.column_expr(column=c.column, mask=c.mask) for c in task.columns)
         sql = f"SELECT {exprs} FROM {self.table_ref(obj=task.source)}"
+        if where:
+            sql += f" WHERE {where}"
         if row_limit is not None:
             sql += self.limit_clause(row_limit=row_limit)
         return sql
@@ -163,6 +165,33 @@ class Source(ABC):
         """Client-side conversions {column index: Arrow type}, for types the driver returns in a
         lossy or awkward form."""
         return {}
+
+    # ---- incremental loads ------------------------------------------------------------------
+
+    def primary_keys(self, conn, catalog: str | None, db_schemas: list[str]) -> dict[tuple[str, str], list[str]]:
+        """(db_schema, table) -> primary-key column names in key order, from the driver's ADBC
+        GetObjects metadata (no source-specific dictionary queries)."""
+        keys: dict[tuple[str, str], list[str]] = {}
+        for db_schema in db_schemas:
+            reader = conn.adbc_get_objects(depth="all", catalog_filter=catalog, db_schema_filter=db_schema)
+            for cat in reader.read_all().to_pylist():
+                for schema in cat.get("catalog_db_schemas") or []:
+                    for table in schema.get("db_schema_tables") or []:
+                        for constraint in table.get("table_constraints") or []:
+                            if constraint.get("constraint_type") == "PRIMARY KEY":
+                                keys[(schema["db_schema_name"], table["table_name"])] = \
+                                    list(constraint["constraint_column_names"])
+        return keys
+
+    def change_token(self) -> str | None:
+        """Where this run's reads stand (e.g. the snapshot SCN); None if the source can't tell
+        which rows changed, so incremental tables fall back to whole-table copies."""
+        return None
+
+    def incremental_filter(self, previous_token: str) -> str | None:
+        """A WHERE condition selecting the rows changed since `previous_token` (a superset is fine:
+        rows are merged on the key)."""
+        return None
 
     def time_zone_warning(self, conn, time_zone: str) -> str | None:
         """A warning when views.source_time_zone doesn't match the source's clock (sources that can tell)."""

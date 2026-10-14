@@ -66,6 +66,18 @@ class OracleSource(Source):
                 errors.append(f"{how}: {e}")
         raise RuntimeError("couldn't read the current SCN: " + "; ".join(errors))
 
+    def change_token(self) -> str | None:
+        return self.snapshot.token if self.snapshot is not None else None
+
+    def incremental_filter(self, previous_token: str) -> str | None:
+        # ORA_ROWSCN is the commit SCN of a row's last change (per block unless the table has
+        # ROWDEPENDENCIES, so unchanged neighbours come too: harmless with a merge). Unlike a
+        # timestamp or sequence column it is commit-ordered, also across RAC instances, so a
+        # late-committing transaction is never missed. Read AS OF the run's snapshot SCN.
+        if self.snapshot is None:
+            return None
+        return f"ORA_ROWSCN > {int(previous_token)}"
+
     def time_zone_warning(self, conn, time_zone: str) -> str | None:
         import datetime
         import zoneinfo

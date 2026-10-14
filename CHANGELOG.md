@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-14
+
+### Added
+
+- Incremental loads: `refresh.mode: incremental` merges only the rows changed since the last run
+  into each table with a primary key (DuckDB `MERGE INTO ... UPDATE BY NAME / INSERT BY NAME`), and
+  `refresh.detect_deletes` (default on) removes rows whose key is gone. Primary keys come from the
+  driver's ADBC `GetObjects` metadata. Oracle finds changed rows with `ORA_ROWSCN` against the
+  previous run's snapshot SCN (commit-ordered, so late commits and RAC sequence caches can't
+  cause misses). Tables without a usable key, and sources without change tracking, keep
+  `changed`-mode behavior; `plan` says which is which.
+
 ### Fixed
 
 - Stopping a run (SIGINT, or the SIGTERM Kubernetes sends when it evicts a pod) cancelled at most

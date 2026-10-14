@@ -123,6 +123,33 @@ class DuckDBFamilyTarget:
                                    catalog_name=self.catalog, db_schema_name=db_schema)
         return rows
 
+    def merge(self, conn, db_schema: str, table: str, key: list[str], staging_db_schema: str, changes: str,
+              keys: str | None) -> tuple[int, int]:
+        """MERGE the staged changed rows into the table on `key` (update matches, insert the rest, both
+        by column name), and when `keys` (a staged list of every source key) is given, MERGE away the
+        target rows whose key is gone. Runs in the caller's transaction; drops the staging tables.
+        MERGE also refuses a key that matches more than once. Returns (rows merged, rows deleted)."""
+        target = self.qualified(db_schema=db_schema, name=table)
+        staged = self.qualified(db_schema=staging_db_schema, name=changes)
+        match = " AND ".join(f"t.{quote_ident(name=k)} = s.{quote_ident(name=k)}" for k in key)
+        merged = self.update(conn=conn, sql=f"MERGE INTO {target} AS t USING {staged} AS s ON ({match}) "
+                                            "WHEN MATCHED THEN UPDATE BY NAME WHEN NOT MATCHED THEN INSERT BY NAME")
+        deleted = 0
+        if keys is not None:
+            current = self.qualified(db_schema=staging_db_schema, name=keys)
+            deleted = self.update(conn=conn, sql=f"MERGE INTO {target} AS t USING {current} AS s ON ({match}) "
+                                                 "WHEN NOT MATCHED BY SOURCE THEN DELETE")
+            self.execute(conn=conn, sql=f"DROP TABLE {current}")
+        self.execute(conn=conn, sql=f"DROP TABLE {staged}")
+        return merged, deleted
+
+    @staticmethod
+    def update(conn, sql: str) -> int:
+        """Run a DML statement and return the number of rows it affected."""
+        with conn.cursor() as cur:
+            cur.execute(operation=sql)
+            return max(cur.rowcount, 0)
+
     def checkpoint(self, conn) -> str | None:
         """Fold the WAL into the database file. Returns an error message instead of raising."""
         try:

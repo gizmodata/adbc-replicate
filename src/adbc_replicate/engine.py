@@ -4,6 +4,7 @@ views, and record everything in the target's sync state."""
 from __future__ import annotations
 
 import concurrent.futures
+import dataclasses
 import datetime
 import hashlib
 import threading
@@ -168,6 +169,10 @@ class Replicator:
         refresh_full = self.options.full_refresh or self.config.refresh.mode == "full"
         marker = self.source.change_marker(obj=task.source)
         row_count = fingerprint = None
+        # refresh.mode incremental, for a table with a usable primary key: merge the changed rows
+        incremental = (self.config.refresh.mode == "incremental" and bool(task.incremental_key)
+                       and self.options.row_limit is None and not self.options.full_refresh)
+        token = self.source.change_token() if incremental else None
         try:
             signature = self.signature(task=task)
             if self.options.row_limit is not None:
@@ -183,27 +188,42 @@ class Replicator:
             elif marker is not None and previous["change_marker"] == marker:
                 return TableResult(task=task, action="skipped", reason="unchanged (change marker)",
                                    row_count=previous["row_count"], fingerprint=previous["fingerprint"],
+                                   seconds=time.monotonic() - started, change_token=token)
+            elif token and previous.get("change_token") and \
+                    (where := self.source.incremental_filter(previous_token=previous["change_token"])) is not None:
+                since = previous["change_token"]
+                self.emit("table_started", f"  🔄 Merging {name} → {task.target_db_schema}.{task.target_table} "
+                          f"(rows changed since {since}, key {', '.join(task.incremental_key)})", table=name,
+                          target=f"{task.target_db_schema}.{task.target_table}", reason="incremental", since=since)
+                merged, deleted, row_count = self._with_retries(task=task, tconn=tconn, load=lambda: self._merge(
+                    task=task, sconn=sconn, tconn=tconn, where=where))
+                return TableResult(task=task, action="merged", reason=f"incremental since {since}", rows=merged,
+                                   deleted=deleted, row_count=row_count, change_token=token,
                                    seconds=time.monotonic() - started)
             else:
                 row_count, fingerprint = self._fingerprint(conn=sconn, task=task)
                 if fingerprint is not None and previous["fingerprint"] == fingerprint \
                         and previous["row_count"] == row_count:
+                    # unchanged as of this run's snapshot, so the next incremental read can start here
                     return TableResult(task=task, action="skipped",
                                        reason=f"unchanged (fingerprint, {fmt_rows(row_count)} rows)",
                                        row_count=row_count, fingerprint=fingerprint,
-                                       seconds=time.monotonic() - started)
+                                       seconds=time.monotonic() - started, change_token=token)
                 reason = "content changed" if fingerprint is not None else "no fingerprint for this table"
 
             # Fingerprint BEFORE the copy: if the table changes in between, the next run sees a
-            # different fingerprint and copies again, never the other way round.
-            if fingerprint is None and self.options.row_limit is None and self.config.refresh.mode == "changed":
+            # different fingerprint and copies again, never the other way round. (Incremental
+            # tables track changes with the change token instead.)
+            if fingerprint is None and self.options.row_limit is None and not incremental \
+                    and self.config.refresh.mode in ("changed", "incremental"):
                 row_count, fingerprint = self._fingerprint(conn=sconn, task=task)
 
             self.emit("table_started", f"  📦 Copying {name} → {task.target_db_schema}.{task.target_table} ({reason})",
                       table=name, target=f"{task.target_db_schema}.{task.target_table}", reason=reason)
-            rows = self._copy_with_retries(task=task, sconn=sconn, tconn=tconn, exists_as_view=exists_as_view)
+            rows = self._with_retries(task=task, tconn=tconn, load=lambda: self._copy(
+                task=task, sconn=sconn, tconn=tconn, exists_as_view=exists_as_view))
             return TableResult(task=task, action="copied", reason=reason, rows=rows, row_count=row_count,
-                               fingerprint=fingerprint, seconds=time.monotonic() - started)
+                               fingerprint=fingerprint, seconds=time.monotonic() - started, change_token=token)
         except Exception as e:
             with suppress(Exception):
                 tconn.rollback()
@@ -212,13 +232,13 @@ class Replicator:
             return TableResult(task=task, action="failed", error=error + (f" — hint: {hint}" if hint else ""),
                                seconds=time.monotonic() - started)
 
-    def _copy_with_retries(self, task: TableTask, sconn, tconn, exists_as_view: bool) -> int:
-        """Re-run a load that failed on a transient connection error. Safe to repeat: the load is
-        one target transaction that replaces the table, and the source re-reads at the same snapshot."""
+    def _with_retries(self, task: TableTask, tconn, load):
+        """Re-run a load that failed on a transient connection error. Safe to repeat: a copy or a
+        merge is one target transaction, and the source re-reads at the same snapshot."""
         retries, wait = self.config.ingest.retries, self.config.ingest.retry_wait_seconds
         for attempt in range(retries + 1):
             try:
-                return self._copy(task=task, sconn=sconn, tconn=tconn, exists_as_view=exists_as_view)
+                return load()
             except Exception as e:
                 if attempt == retries or not is_transient(error=e) or self._stop.is_set() or self.interrupted:
                     raise
@@ -233,11 +253,38 @@ class Replicator:
         raise AssertionError("unreachable")
 
     def _copy(self, task: TableTask, sconn, tconn, exists_as_view: bool) -> int:
-        name = task.source.qualified_name
         if exists_as_view:
             # A view of the same name would block the ingest's CREATE OR REPLACE TABLE.
             self.target.drop(conn=tconn, db_schema=task.target_db_schema, name=task.target_table, kind="VIEW")
-        sql = self.source.select_sql(task=task, row_limit=self.options.row_limit)
+        copied = self._load(task=task, sql=self.source.select_sql(task=task, row_limit=self.options.row_limit),
+                            sconn=sconn, tconn=tconn, db_schema=task.target_db_schema, table=task.target_table)
+        tconn.commit()
+        return copied
+
+    def _merge(self, task: TableTask, sconn, tconn, where: str) -> tuple[int, int, int]:
+        """Stage the rows changed since the last run (and, for delete detection, every current key)
+        in the state db_schema, then merge them into the table in the same target transaction."""
+        staging = self.config.state.db_schema
+        suffix = hashlib.sha256("|".join(task.target_key).encode()).hexdigest()[:8]
+        changes, keys = f"_changes_{suffix}", f"_keys_{suffix}"
+        self._load(task=task, sql=self.source.select_sql(task=task, where=where), sconn=sconn, tconn=tconn,
+                   db_schema=staging, table=changes)
+        if self.config.refresh.detect_deletes:
+            key_task = dataclasses.replace(task, columns=[c for c in task.columns
+                                                          if c.target_name in task.incremental_key])
+            self._load(task=key_task, sql=self.source.select_sql(task=key_task), sconn=sconn, tconn=tconn,
+                       db_schema=staging, table=keys, quiet=True)
+        merged, deleted = self.target.merge(conn=tconn, db_schema=task.target_db_schema, table=task.target_table,
+                                            key=task.incremental_key, staging_db_schema=staging, changes=changes,
+                                            keys=keys if self.config.refresh.detect_deletes else None)
+        row_count = self.target.query(conn=tconn, sql="SELECT count(*) FROM " + self.target.qualified(
+            db_schema=task.target_db_schema, name=task.target_table))[0][0]
+        tconn.commit()
+        return merged, deleted, int(row_count)
+
+    def _load(self, task: TableTask, sql: str, sconn, tconn, db_schema: str, table: str, quiet: bool = False) -> int:
+        """Stream a source SELECT into a (new copy of a) target table, in the caller's transaction."""
+        name = task.source.qualified_name
         copied = 0
         started = last_report = time.monotonic()
 
@@ -245,7 +292,7 @@ class Replicator:
             nonlocal copied, last_report
             copied += rows
             now = time.monotonic()
-            if now - last_report >= PROGRESS_EVERY_SECONDS:
+            if now - last_report >= PROGRESS_EVERY_SECONDS and not quiet:
                 last_report = now
                 self.emit("table_progress", f"     ⏳ {name}: {fmt_rows(copied)} rows ({fmt_seconds(now - started)})",
                           table=name, rows=copied, seconds=round(now - started, 1))
@@ -259,9 +306,7 @@ class Replicator:
             reader = coalesce(reader=reader, max_rows=self.config.ingest.batch_rows,
                               max_bytes=self.config.ingest.batch_bytes)
             reader = counting(reader=reader, on_batch=progress)
-            self.target.ingest(conn=tconn, db_schema=task.target_db_schema, table=task.target_table, reader=reader,
-                               track=self.track)
-        tconn.commit()
+            self.target.ingest(conn=tconn, db_schema=db_schema, table=table, reader=reader, track=self.track)
         return copied
 
     def copy_tables(self, plan: Plan, store: StateStore, run_id: str, table_state: dict,
@@ -282,13 +327,25 @@ class Replicator:
                 else:
                     store.save_table(task=task, change_marker=self.source.change_marker(obj=task.source),
                                      fingerprint=result.fingerprint, row_count=result.row_count,
-                                     column_signature=self.signature(task=task), copied=True, run_id=run_id)
+                                     column_signature=self.signature(task=task), copied=True, run_id=run_id,
+                                     change_token=result.change_token)
+            elif result.action == "merged":
+                self.emit("table_merged", f"  ✅ {name}: {fmt_rows(result.rows)} changed rows merged, "
+                          f"{fmt_rows(result.deleted)} deleted in {fmt_seconds(result.seconds)} "
+                          f"({fmt_rows(result.row_count)} rows now)", table=name, target=target_name,
+                          rows=result.rows, deleted=result.deleted, row_count=result.row_count,
+                          seconds=round(result.seconds, 2))
+                store.save_table(task=task, change_marker=self.source.change_marker(obj=task.source),
+                                 fingerprint=None, row_count=result.row_count,
+                                 column_signature=self.signature(task=task), copied=True, run_id=run_id,
+                                 change_token=result.change_token)
             elif result.action == "skipped":
                 self.emit("table_skipped", f"  ⏭️  {name}: {result.reason}", table=name, target=target_name,
                           reason=result.reason)
                 store.save_table(task=task, change_marker=self.source.change_marker(obj=task.source),
                                  fingerprint=result.fingerprint, row_count=result.row_count,
-                                 column_signature=self.signature(task=task), copied=False, run_id=run_id)
+                                 column_signature=self.signature(task=task), copied=False, run_id=run_id,
+                                 change_token=result.change_token)
             elif result.action == "failed":
                 self.emit("table_failed", f"  ❌ {name}: {result.error}", level="error", table=name,
                           target=target_name, error=result.error)
@@ -530,13 +587,19 @@ class Replicator:
                         conn.close()
                 self._worker_connections.clear()
             copied = [r for r in results if r.action == "copied"]
+            merged = [r for r in results if r.action == "merged"]
             failed = [r for r in results if r.action == "failed"]
             stats.update(tables_copied=len(copied), tables_skipped=sum(r.action == "skipped" for r in results),
                          tables_failed=len(failed), rows_copied=sum(r.rows or 0 for r in copied))
+            if merged:
+                stats.update(tables_merged=len(merged), rows_merged=sum(r.rows or 0 for r in merged),
+                             rows_deleted=sum(r.deleted or 0 for r in merged))
             self.emit("tables_finished", f"📊 Tables: {len(copied)} copied ({fmt_rows(stats['rows_copied'])} rows), "
-                      f"{stats['tables_skipped']} unchanged, {len(failed)} failed "
+                      + (f"{len(merged)} merged ({fmt_rows(stats['rows_merged'])} changed rows, "
+                         f"{fmt_rows(stats['rows_deleted'])} deleted), " if merged else "")
+                      + f"{stats['tables_skipped']} unchanged, {len(failed)} failed "
                       f"in {fmt_seconds(time.monotonic() - tables_started)}",
-                      copied=len(copied), skipped=stats["tables_skipped"], failed=len(failed),
+                      copied=len(copied), merged=len(merged), skipped=stats["tables_skipped"], failed=len(failed),
                       rows=stats["rows_copied"])
             table_failures = {r.task.source.qualified_name: r.error for r in failed}
 
@@ -563,7 +626,7 @@ class Replicator:
                     self.emit("view_failed", f"  ❌ {name}: {error}", level="error", view=name, error=error)
             stats.update(views_created=views_created, views_skipped=views_skipped, views_failed=len(view_failures))
 
-            if self.config.target.checkpoint and (copied or views_created) and not self.interrupted:
+            if self.config.target.checkpoint and (copied or merged or views_created) and not self.interrupted:
                 error = self.target.checkpoint(conn=target_conn)
                 if error:
                     self.emit("warning", f"⚠️  CHECKPOINT after load failed: {error}", level="warning")

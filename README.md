@@ -125,7 +125,7 @@ adbc-replicate run --config replicate.yaml
 ```
 
 ```text
-✅ Source (postgresql): connected in 2.4s; catalog postgres, 2 db_schema(s) visible
+✅ Source (postgresql): connected in 2.5s; catalog postgres, 2 db_schema(s) visible
 ✅ Target (gizmosql): connected in 0.4s; catalog warehouse, DuckDB v1.5.6
 
 🗺️  Plan for shop-to-gizmosql: postgresql → gizmosql
@@ -139,7 +139,7 @@ adbc-replicate run --config replicate.yaml
 
 ✨ 2 table(s) to copy, 1 view(s) ready
 
-🚀 adbc-replicate 0.2.0: postgresql → gizmosql (catalog warehouse), run 4dfefc37-8992-4331-9ad6-9bf39f639c35
+🚀 adbc-replicate 0.3.0: postgresql → gizmosql (catalog warehouse), run a48e2442-0100-4af9-9dce-92d9823ec16e
 📸 Consistent read: exported snapshot 00000003-00000032-1
 🔍 Discovering source objects…
 🗺️  2 table(s) and 1 view(s) selected (0.0s)
@@ -183,7 +183,7 @@ with gizmosql.connect(uri="gizmosql://127.0.0.1:31338?transport=tcp", username="
 
 ```text
 [(1, 'Customer 1', 'ed8558a632ff0bd6474c36a8bd16cb1381af61b57534295a4eda9f8a9a4d6a8e'), (2, 'Customer 2', 'b9749b...'), ...]
-[('Customer 327', Decimal('29650.58')), ('Customer 237', Decimal('29624.06')), ('Customer 574', Decimal('29325.65'))]
+[('Customer 479', Decimal('29134.77')), ('Customer 977', Decimal('29014.86')), ('Customer 937', Decimal('28795.45'))]
 [('completed', 2, 101000), ('completed', 0, 0)]
 ```
 
@@ -342,6 +342,37 @@ run; `plan` lists them. `refresh.mode: full` (or `run --full-refresh`) copies ev
 Each copy is a `CREATE OR REPLACE` inside a transaction: readers see the old table until
 the new one commits.
 
+
+#### Incremental loads
+
+```yaml
+refresh:
+  mode: incremental          # changed rows only, merged on the primary key
+  detect_deletes: true       # default: also remove rows whose key is gone from the source
+```
+
+(For Oracle, set `source.consistency: snapshot`: the snapshot SCN is where the next run starts.)
+
+With `refresh.mode: incremental`, a table that has a primary key gets only the rows that changed
+since the last run, merged into the target with DuckDB `MERGE INTO` on the key (matching rows
+updated, new ones inserted, by column name). With `detect_deletes`, each run also reads the
+source's key column(s) and deletes target rows whose key no longer exists. Keys come from the
+driver's ADBC catalog metadata (`GetObjects`), not a source-specific dictionary query; `plan`
+shows `incremental on <key>` per table, or why a table gets whole-table copies instead (no
+primary key, or a key column that is excluded or masked other than with `hash`).
+
+How a source tells which rows changed:
+
+- **Oracle:** `ORA_ROWSCN > <the previous run's snapshot SCN>`, read `AS OF` the current snapshot.
+  `ORA_ROWSCN` is the commit SCN of a row's last change, so unlike a timestamp or sequence column
+  it never misses a transaction that commits late (also on RAC, where sequence caches make IDs
+  arrive out of order). Unless a table was created with `ROWDEPENDENCIES` it's tracked per
+  block, so some unchanged rows come along; the merge makes that harmless.
+- **Other sources** have no change tracking yet: their tables behave as in `changed` mode.
+
+The first incremental run copies each table whole (or confirms it unchanged) and records where
+it stood; later runs merge. Tables without a usable key keep `changed`-mode behavior.
+
 ### Views
 
 Views are recreated in the target after the tables, in DuckDB SQL:
@@ -399,7 +430,7 @@ the replication, and only the URL's host is ever printed. `adbc-replicate test-n
 naming:
   case: lower            # lower (default) | upper | preserve
 refresh:
-  mode: changed          # changed (default) | full
+  mode: changed          # changed (default) | full | incremental
 parallelism: 4           # tables copied at once
 on_table_error: abort    # abort (default: skip views, fail the run) | continue
 ingest:

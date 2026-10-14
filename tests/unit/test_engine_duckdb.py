@@ -483,3 +483,32 @@ def test_cancel_interrupts_every_in_flight_load(paths, monkeypatch):
     assert summary.status == "interrupted" and summary.exit_code == EXIT_INTERRUPTED
     assert "Views skipped: the run was interrupted (SIGTERM)" in out.getvalue()
     assert target_query(paths=paths, sql="SELECT status FROM _adbc_replicate.run_log")[0][0] == "interrupted"
+
+
+def test_incremental_key_decision():
+    from adbc_replicate.config import MaskSpec
+    from adbc_replicate.models import Column, SelectedColumn, SourceObject, TableTask
+    from adbc_replicate.planner import _incremental_key
+
+    def task(primary_key, masks=None, drop=()):
+        cols = [Column(name=n, data_type="NUMBER") for n in ("ID", "LINE", "AMOUNT")]
+        obj = SourceObject(catalog=None, db_schema="S", name="T", kind="TABLE", columns=cols, primary_key=primary_key)
+        selected = [SelectedColumn(column=c, target_name=c.name.lower(), mask=(masks or {}).get(c.name))
+                    for c in cols if c.name not in drop]
+        return TableTask(source=obj, target_db_schema="s", target_table="t", columns=selected)
+
+    assert _incremental_key(task=task(primary_key=["ID", "LINE"])) == (["id", "line"], None)
+    assert _incremental_key(task=task(primary_key=None)) == (None, "no primary key")
+    assert _incremental_key(task=task(primary_key=["ID"], drop=("ID",)))[1] == "primary-key column ID is excluded"
+    assert _incremental_key(task=task(primary_key=["ID"], masks={"ID": MaskSpec(strategy="null")}))[1] == \
+        "primary-key column ID is masked (null)"
+    assert _incremental_key(task=task(primary_key=["ID"], masks={"ID": MaskSpec(strategy="hash")})) == (["id"], None)
+
+
+def test_incremental_mode_falls_back_where_the_source_cannot_track_changes(paths):
+    # DuckDB sources have no change token: incremental mode behaves like "changed" (fingerprints).
+    config = make_config(paths=paths, refresh={"mode": "incremental"})
+    summary, out = run(config=config, skip_views=True)
+    assert summary.exit_code == EXIT_OK and summary.stats["tables_copied"] == 2, out
+    summary, out = run(config=config, skip_views=True)
+    assert summary.stats["tables_copied"] == 0 and "unchanged (fingerprint" in out, out

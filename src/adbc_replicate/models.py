@@ -30,6 +30,7 @@ class SourceObject:
     columns: list[Column] = field(default_factory=list)
     last_altered: datetime.datetime | None = None   # set only where it reliably tracks data changes
     external: bool = False         # data lives outside the database (files): no snapshot reads
+    primary_key: list[str] | None = None   # source column names, in key order (refresh.mode: incremental)
 
     @property
     def qualified_name(self) -> str:
@@ -53,6 +54,8 @@ class TableTask:
     columns: list[SelectedColumn]
     excluded_columns: list[str] = field(default_factory=list)
     note: str | None = None        # e.g. "view materialized as a table"
+    incremental_key: list[str] | None = None   # target column names to merge on; None: whole-table copies
+    incremental_note: str | None = None        # why a table isn't incremental (refresh.mode: incremental)
 
     @property
     def target_key(self) -> tuple[str, str]:
@@ -87,10 +90,12 @@ class Plan:
 @dataclass
 class TableResult:
     task: TableTask
-    action: str                    # copied | skipped | failed
+    action: str                    # copied | merged | skipped | failed
     reason: str = ""
     rows: int | None = None
     row_count: int | None = None
     fingerprint: str | None = None
     seconds: float = 0.0
     error: str | None = None
+    change_token: str | None = None   # where the next incremental read starts (e.g. an Oracle SCN)
+    deleted: int | None = None        # rows removed by an incremental merge's delete detection
