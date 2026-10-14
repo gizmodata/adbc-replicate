@@ -125,8 +125,8 @@ adbc-replicate run --config replicate.yaml
 ```
 
 ```text
-✅ Source (postgresql): connected in 0.9s; catalog postgres, 2 db_schema(s) visible
-✅ Target (gizmosql): connected in 0.3s; catalog warehouse, DuckDB v1.5.6
+✅ Source (postgresql): connected in 2.4s; catalog postgres, 2 db_schema(s) visible
+✅ Target (gizmosql): connected in 0.4s; catalog warehouse, DuckDB v1.5.6
 
 🗺️  Plan for shop-to-gizmosql: postgresql → gizmosql
 
@@ -139,8 +139,8 @@ adbc-replicate run --config replicate.yaml
 
 ✨ 2 table(s) to copy, 1 view(s) ready
 
-🚀 adbc-replicate 0.1.0: postgresql → gizmosql (catalog warehouse), run c916fe34-908a-4ebd-a714-b9374f31aba6
-📸 Consistent read: exported snapshot 00000003-0000008D-1
+🚀 adbc-replicate 0.2.0: postgresql → gizmosql (catalog warehouse), run 4dfefc37-8992-4331-9ad6-9bf39f639c35
+📸 Consistent read: exported snapshot 00000003-00000032-1
 🔍 Discovering source objects…
 🗺️  2 table(s) and 1 view(s) selected (0.0s)
 📦 Copying tables (parallelism 2)…
@@ -183,7 +183,7 @@ with gizmosql.connect(uri="gizmosql://127.0.0.1:31338?transport=tcp", username="
 
 ```text
 [(1, 'Customer 1', 'ed8558a632ff0bd6474c36a8bd16cb1381af61b57534295a4eda9f8a9a4d6a8e'), (2, 'Customer 2', 'b9749b...'), ...]
-[('Customer 958', Decimal('30571.87')), ('Customer 581', Decimal('29955.40')), ('Customer 616', Decimal('29601.96'))]
+[('Customer 327', Decimal('29650.58')), ('Customer 237', Decimal('29624.06')), ('Customer 574', Decimal('29325.65'))]
 [('completed', 2, 101000), ('completed', 0, 0)]
 ```
 
