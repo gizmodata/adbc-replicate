@@ -1,0 +1,91 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "adbc-replicate"
+dynamic = ["version"]
+description = "Config-driven ADBC-to-ADBC replication: stream whole schemas from Oracle, PostgreSQL, Snowflake or DuckDB into GizmoSQL, with no data materialised on the client."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "GizmoData LLC", email = "info@gizmodata.com" }]
+keywords = ["adbc", "arrow", "replication", "gizmosql", "duckdb", "oracle", "postgresql", "snowflake", "etl", "elt"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Database",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
+dependencies = [
+    "adbc-driver-manager>=1.8.0",
+    "pyarrow>=18.0.0",
+    "sqlglot>=27.0.0",
+    "pydantic>=2.7.0",
+    "pyyaml>=6.0",
+    "click>=8.1.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+oracle = ["adbc-driver-oracle>=1.0.0"]
+postgresql = ["adbc-driver-postgresql>=1.8.0"]
+snowflake = ["adbc-driver-snowflake>=1.8.0"]
+gizmosql = ["adbc-driver-gizmosql>=2.0.0"]
+duckdb = ["duckdb>=1.5.6,<2"]
+all = [
+    "adbc-driver-oracle>=1.0.0",
+    "adbc-driver-postgresql>=1.8.0",
+    "adbc-driver-snowflake>=1.8.0",
+    "adbc-driver-gizmosql>=2.0.0",
+    # DuckDB publishes no Python 3.15 wheels yet (building it from source takes ~30 min)
+    "duckdb>=1.5.6,<2; python_version < '3.15'",
+]
+dev = [
+    "adbc-replicate[all]",
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+adbc-replicate = "adbc_replicate.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/gizmodata/adbc-replicate"
+Repository = "https://github.com/gizmodata/adbc-replicate"
+Changelog = "https://github.com/gizmodata/adbc-replicate/blob/main/CHANGELOG.md"
+Issues = "https://github.com/gizmodata/adbc-replicate/issues"
+
+[tool.hatch.version]
+path = "src/adbc_replicate/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/adbc_replicate"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Snowflake tests need credentials: run them explicitly with -m snowflake.
+addopts = "-m 'not snowflake'"
+markers = [
+    "integration: needs the GizmoSQL, Oracle and PostgreSQL test containers (see docker-compose.yml)",
+    "snowflake: needs ADBC_REPLICATE_TEST_SNOWFLAKE_* credentials (CI: main pushes and release tags)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "RUF"]
+ignore = [
+    "RUF001", "RUF003",   # emoji and typographic characters in user-facing text are intentional
+    "B027",               # Source's empty hook methods are deliberate defaults, not missing abstracts
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E501"]     # long SQL literals read better unwrapped

@@ -1,0 +1,9 @@
+.venv
+.git
+.github
+tests
+charts
+dist
+**/__pycache__
+*.duckdb
+.env

@@ -1,0 +1,218 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # release.yml runs this whole workflow against the tagged commit before publishing anything.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - run: pip install ruff
+      - run: ruff check src tests
+
+  unit:
+    name: unit (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ['3.11', '3.12', '3.13', '3.14']
+        include:
+          - os: macos-latest
+            python: '3.13'
+          - os: windows-latest
+            python: '3.13'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/unit -v
+
+  lowest-dependencies:
+    # The oldest versions pyproject.toml allows must really work.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv venv --python 3.11
+      - run: uv pip install --resolution lowest-direct -e ".[all]" "pytest>=8"
+      - run: uv pip list
+      - run: .venv/bin/pytest tests/unit -v
+
+  integration:
+    name: integration (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.14']
+    services: &services
+      gizmosql:
+        image: gizmodata/gizmosql:v1.41.0-slim
+        env:
+          GIZMOSQL_USERNAME: gizmosql
+          GIZMOSQL_PASSWORD: gizmosql
+          TLS_ENABLED: '0'
+          DATABASE_FILENAME: /tmp/target.duckdb
+        ports:
+          - 31377:31337
+      oracle:
+        image: gvenzl/oracle-free:23-slim-faststart
+        env:
+          ORACLE_PASSWORD: oracle
+          APP_USER: replicate
+          APP_USER_PASSWORD: replicate
+        ports:
+          - 15211:1521
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 30
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: source
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      # An unreachable service FAILS these tests (never skips), and pytest exits 5 if nothing ran.
+      - run: pytest tests/integration -m integration -v
+
+  python-3-15:
+    # Python 3.15 is brand new: adbc-driver-manager and pyyaml build from source here, and DuckDB
+    # has no 3.15 wheels yet, so this job covers the Oracle / PostgreSQL → GizmoSQL path.
+    runs-on: ubuntu-latest
+    services: *services
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.15'
+          allow-prereleases: true
+      - run: pip install -e ".[oracle,postgresql,gizmosql]" "pytest>=8"
+      - run: pytest tests/unit --ignore=tests/unit/test_engine_duckdb.py -v
+      - run: pytest tests/integration -m integration -v
+
+  snowflake:
+    # Needs credentials, so it doesn't run for pull requests (fork PRs get no secrets). Everywhere
+    # else, including the release gate, missing secrets are a failure.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    services:
+      gizmosql:
+        image: gizmodata/gizmosql:v1.41.0-slim
+        env:
+          GIZMOSQL_USERNAME: gizmosql
+          GIZMOSQL_PASSWORD: gizmosql
+          TLS_ENABLED: '0'
+          DATABASE_FILENAME: /tmp/target.duckdb
+        ports:
+          - 31377:31337
+    env:
+      ADBC_REPLICATE_TEST_SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      ADBC_REPLICATE_TEST_SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+      ADBC_REPLICATE_TEST_SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/integration -m snowflake -v
+
+  docker:
+    # Build the image and run a real PostgreSQL → GizmoSQL replication with it.
+    runs-on: ubuntu-latest
+    services:
+      gizmosql:
+        image: gizmodata/gizmosql:v1.41.0-slim
+        env:
+          GIZMOSQL_USERNAME: gizmosql
+          GIZMOSQL_PASSWORD: gizmosql
+          TLS_ENABLED: '0'
+          DATABASE_FILENAME: /tmp/target.duckdb
+        ports:
+          - 31377:31337
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: source
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t adbc-replicate:ci .
+      - run: docker run --rm adbc-replicate:ci --version
+      - name: Seed PostgreSQL
+        run: |
+          docker exec ${{ job.services.postgres.id }} psql -U postgres -d source -v ON_ERROR_STOP=1 -c "
+            CREATE SCHEMA app;
+            CREATE TABLE app.items AS SELECT i AS id, 'item ' || i AS name, i * 1.5::numeric(10,2) AS price
+            FROM generate_series(1, 1000) i;
+            CREATE VIEW app.cheap AS SELECT id, name FROM app.items WHERE price < 100;"
+      - name: Replicate with the image
+        run: |
+          cat > /tmp/replicate.yaml <<'EOF'
+          version: 1
+          source: {type: postgresql, uri: "postgresql://127.0.0.1:15432/source", username: postgres, password: "${PGPASSWORD}"}
+          target: {type: gizmosql, uri: "gizmosql://127.0.0.1:31377?transport=tcp", username: gizmosql, password: "${GZPASSWORD}"}
+          objects: [{db_schemas: [app]}]
+          EOF
+          for _ in 1 2 3 4 5 6; do
+            docker run --rm --network host -v /tmp/replicate.yaml:/config/replicate.yaml:ro \
+              -e PGPASSWORD=postgres -e GZPASSWORD=gizmosql adbc-replicate:ci test-connection -c /config/replicate.yaml && break
+            sleep 5
+          done
+          docker run --rm --network host -v /tmp/replicate.yaml:/config/replicate.yaml:ro \
+            -e PGPASSWORD=postgres -e GZPASSWORD=gizmosql adbc-replicate:ci run -c /config/replicate.yaml
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v4
+      - run: helm lint charts/adbc-replicate --set config.version=1
+      - run: |
+          helm template demo charts/adbc-replicate \
+            --set config.version=1 --set existingSecret=demo-env \
+            --set-string 'viewOverrides.HR\.V_X\.sql=SELECT 1' > /tmp/rendered.yaml
+          grep -q 'kind: CronJob' /tmp/rendered.yaml
+          grep -q 'concurrencyPolicy: Forbid' /tmp/rendered.yaml
+          grep -q 'karpenter.sh/do-not-disrupt' /tmp/rendered.yaml

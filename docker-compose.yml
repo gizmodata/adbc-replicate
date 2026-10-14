@@ -1,0 +1,37 @@
+# Test services for the integration suite (same images and ports as CI):
+#   docker compose up -d --wait
+#   pytest -m integration
+services:
+  gizmosql:
+    image: gizmodata/gizmosql:v1.41.0-slim
+    ports: ["31377:31337"]
+    environment:
+      GIZMOSQL_USERNAME: gizmosql
+      GIZMOSQL_PASSWORD: gizmosql
+      TLS_ENABLED: "0"
+      DATABASE_FILENAME: /tmp/target.duckdb
+
+  oracle:
+    image: gvenzl/oracle-free:23-slim-faststart
+    ports: ["15211:1521"]
+    environment:
+      ORACLE_PASSWORD: oracle
+      APP_USER: replicate
+      APP_USER_PASSWORD: replicate
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  postgres:
+    image: postgres:16-alpine
+    ports: ["15432:5432"]
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: source
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

@@ -1,0 +1,86 @@
+image:
+  repository: ghcr.io/gizmodata/adbc-replicate
+  # Defaults to the chart's appVersion. Version tags are immutable, so IfNotPresent is safe.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# When to run (cron syntax) and in which time zone (e.g. "America/Chicago"; empty = controller default).
+schedule: "0 * * * *"
+timeZone: ""
+suspend: false
+# Runs against one target must never overlap.
+concurrencyPolicy: Forbid
+startingDeadlineSeconds: 600
+backoffLimit: 1
+# Kill a run that takes longer than this (seconds); null = no limit.
+activeDeadlineSeconds: null
+successfulJobsHistoryLimit: 3
+failedJobsHistoryLimit: 5
+
+# The replication config (the same document the CLI reads), rendered into a ConfigMap and
+# mounted at /config/replicate.yaml. Reference secrets as ${VAR}; never put them here.
+config: {}
+#   version: 1
+#   name: oracle-to-gizmosql
+#   source:
+#     type: oracle
+#     uri: oracle://oracle.example.com:1521/ORCLPDB1
+#     username: ${ORACLE_USERNAME}
+#     password: ${ORACLE_PASSWORD}
+#     consistency: serializable
+#   target:
+#     type: gizmosql
+#     uri: gizmosql://gizmosql.example.com:31337
+#     username: ${GIZMOSQL_USERNAME}
+#     password: ${GIZMOSQL_PASSWORD}
+#   objects:
+#     - db_schemas: [HR]
+
+# Hand-written view bodies ({"<DB_SCHEMA>.<VIEW>.sql": "SELECT ..."}), mounted at
+# /config/view-overrides. Set config.views.overrides_dir: /config/view-overrides to use them.
+viewOverrides: {}
+
+# Extra CLI arguments for `adbc-replicate run`, e.g. ["--log-format", "json"].
+extraArgs: []
+
+# Environment variables referenced by ${VAR} in the config.
+# Preferred: an existing Secret whose keys become environment variables.
+existingSecret: ""
+# Alternative for development only: the chart creates a Secret from these values.
+secretEnv: {}
+# Plain (non-secret) environment variables.
+env: []
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 1536Mi
+
+podAnnotations:
+  # Don't let Karpenter / NAP consolidation evict a run mid-copy.
+  karpenter.sh/do-not-disrupt: "true"
+podLabels: {}
+
+serviceAccount:
+  create: false
+  name: ""
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

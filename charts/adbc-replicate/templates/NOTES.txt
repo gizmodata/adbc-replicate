@@ -1,0 +1,10 @@
+adbc-replicate is scheduled: {{ .Values.schedule }}{{ with .Values.timeZone }} ({{ . }}){{ end }}{{ if .Values.suspend }} — SUSPENDED{{ end }}.
+
+Run it now:
+  kubectl -n {{ .Release.Namespace }} create job --from=cronjob/{{ include "adbc-replicate.fullname" . }} {{ include "adbc-replicate.fullname" . }}-manual-$(date +%s)
+
+Follow the latest run:
+  kubectl -n {{ .Release.Namespace }} logs -f -l app.kubernetes.io/instance={{ .Release.Name }} --tail=200
+
+Run history lives in the target, in the {{ default "_adbc_replicate" (dig "state" "db_schema" "" .Values.config) }} db_schema:
+  SELECT * FROM {{ default "_adbc_replicate" (dig "state" "db_schema" "" .Values.config) }}.run_log ORDER BY started_at DESC;

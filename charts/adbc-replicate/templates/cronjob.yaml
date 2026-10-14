@@ -1,0 +1,104 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "adbc-replicate.fullname" . }}
+  labels:
+    {{- include "adbc-replicate.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.schedule | quote }}
+  {{- with .Values.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
+  suspend: {{ .Values.suspend }}
+  concurrencyPolicy: {{ .Values.concurrencyPolicy }}
+  startingDeadlineSeconds: {{ .Values.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ .Values.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.backoffLimit }}
+      {{- with .Values.activeDeadlineSeconds }}
+      activeDeadlineSeconds: {{ . }}
+      {{- end }}
+      template:
+        metadata:
+          labels:
+            {{- include "adbc-replicate.labels" . | nindent 12 }}
+            {{- with .Values.podLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+            {{- with .Values.podAnnotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        spec:
+          restartPolicy: Never
+          {{- if or .Values.serviceAccount.create .Values.serviceAccount.name }}
+          serviceAccountName: {{ default (include "adbc-replicate.fullname" .) .Values.serviceAccount.name }}
+          {{- end }}
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: adbc-replicate
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args:
+                - run
+                - --config
+                - /config/replicate.yaml
+                {{- range .Values.extraArgs }}
+                - {{ . | quote }}
+                {{- end }}
+              {{- if or .Values.existingSecret .Values.secretEnv }}
+              envFrom:
+                - secretRef:
+                    name: {{ include "adbc-replicate.secretName" . }}
+              {{- end }}
+              {{- with .Values.env }}
+              env:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              volumeMounts:
+                - name: config
+                  mountPath: /config/replicate.yaml
+                  subPath: replicate.yaml
+                  readOnly: true
+                {{- if .Values.viewOverrides }}
+                - name: view-overrides
+                  mountPath: /config/view-overrides
+                  readOnly: true
+                {{- end }}
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: config
+              configMap:
+                name: {{ include "adbc-replicate.fullname" . }}
+            {{- if .Values.viewOverrides }}
+            - name: view-overrides
+              configMap:
+                name: {{ include "adbc-replicate.fullname" . }}-view-overrides
+            {{- end }}
+            - name: tmp
+              emptyDir: {}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}

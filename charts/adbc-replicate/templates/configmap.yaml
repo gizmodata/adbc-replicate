@@ -1,0 +1,26 @@
+{{- if not .Values.config }}
+{{- fail "values.config is required: the replication config (see values.yaml)" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "adbc-replicate.fullname" . }}
+  labels:
+    {{- include "adbc-replicate.labels" . | nindent 4 }}
+data:
+  replicate.yaml: |
+    {{- toYaml .Values.config | nindent 4 }}
+{{- if .Values.viewOverrides }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "adbc-replicate.fullname" . }}-view-overrides
+  labels:
+    {{- include "adbc-replicate.labels" . | nindent 4 }}
+data:
+  {{- range $name, $sql := .Values.viewOverrides }}
+  {{ $name }}: |
+    {{- $sql | nindent 4 }}
+  {{- end }}
+{{- end }}
