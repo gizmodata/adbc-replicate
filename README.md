@@ -219,7 +219,13 @@ Extras: `oracle`, `postgresql`, `snowflake`, `gizmosql`, `duckdb`, `all`. On Pyt
 
 **Exit codes:** `0` completed · `1` failed (a table failed, or the run couldn't start) ·
 `2` config or plan error (e.g. a mask rule that matches nothing) · `3` completed, but some
-views couldn't be created. Schedulers can alert on anything non-zero.
+views couldn't be created · `130` / `143` interrupted by SIGINT / SIGTERM. Schedulers can
+alert on anything non-zero.
+
+**Stopping a run** (Ctrl-C, `kill`, or Kubernetes evicting the pod) cancels every statement in
+flight, in every worker, so their target transactions roll back and no server session is left
+holding locks; views are skipped, the run is logged as `interrupted` and notifications fire. A
+second signal exits at once.
 
 ## 📝 The config
 

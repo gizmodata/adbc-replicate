@@ -263,12 +263,12 @@ def test_transient_ingest_error_is_retried(paths, monkeypatch):
     real_ingest = DuckDBFamilyTarget.ingest
     failures = {"hr.employees": 1}
 
-    def flaky_ingest(self, conn, db_schema, table, reader):
+    def flaky_ingest(self, conn, db_schema, table, reader, track=None):
         if failures.get(f"{db_schema}.{table}", 0):
             failures[f"{db_schema}.{table}"] -= 1
             reader.read_all()                      # the upload happened, then the proxy dropped it
             raise RuntimeError(DRAINING)
-        return real_ingest(self, conn=conn, db_schema=db_schema, table=table, reader=reader)
+        return real_ingest(self, conn=conn, db_schema=db_schema, table=table, reader=reader, track=track)
 
     monkeypatch.setattr(DuckDBFamilyTarget, "ingest", flaky_ingest)
     summary, out = run(config=make_config(paths=paths, ingest={"retry_wait_seconds": 0}), skip_views=True)
@@ -281,7 +281,7 @@ def test_non_transient_ingest_error_is_not_retried(paths, monkeypatch):
     from adbc_replicate.targets.duckdb import DuckDBFamilyTarget
     calls = []
 
-    def broken_ingest(self, conn, db_schema, table, reader):
+    def broken_ingest(self, conn, db_schema, table, reader, track=None):
         calls.append(table)
         raise RuntimeError("413 Request Entity Too Large (Unknown; ExecuteIngest)")
 
@@ -374,7 +374,7 @@ def webhook():
 def test_failure_notifies_slack_with_the_failed_tables(paths, webhook, monkeypatch):
     from adbc_replicate.targets.duckdb import DuckDBFamilyTarget
 
-    def broken_ingest(self, conn, db_schema, table, reader):
+    def broken_ingest(self, conn, db_schema, table, reader, track=None):
         raise RuntimeError("disk full")
 
     monkeypatch.setattr(DuckDBFamilyTarget, "ingest", broken_ingest)
@@ -441,3 +441,45 @@ def test_cli_test_notifications(paths, webhook, tmp_path):
     result = CliRunner().invoke(main, ["test-notifications", "--config", str(cfg)])
     assert result.exit_code == 0, result.output
     assert webhook.bodies[-1]["text"] == "🧪 nightly-hr: test notification"
+
+
+def test_cancel_interrupts_every_in_flight_load(paths, monkeypatch):
+    """cancel() (what SIGINT/SIGTERM trigger) must cancel the loads running in every worker, not just
+    the main thread's, and stop the run without views: killed loads left server sessions holding locks."""
+    import threading
+
+    from adbc_replicate.engine import EXIT_INTERRUPTED
+    from adbc_replicate.targets.duckdb import DuckDBFamilyTarget
+
+    started, cancelled = threading.Semaphore(0), []
+
+    class FakeCursor:
+        def __init__(self):
+            self.event = threading.Event()
+
+        def adbc_cancel(self):
+            cancelled.append(self)
+            self.event.set()
+
+    def slow_ingest(self, conn, db_schema, table, reader, track=None):
+        cursor = FakeCursor()
+        with track(cursor=cursor):
+            started.release()
+            if not cursor.event.wait(timeout=30):
+                raise AssertionError("never cancelled")
+            raise RuntimeError("CANCELLED: context canceled")
+
+    monkeypatch.setattr(DuckDBFamilyTarget, "ingest", slow_ingest)
+    out = io.StringIO()
+    replicator = Replicator(config=make_config(paths=paths, parallelism=2), reporter=Reporter(fmt="text", stream=out))
+    result = {}
+    thread = threading.Thread(target=lambda: result.update(summary=replicator.run()))
+    thread.start()
+    assert started.acquire(timeout=30) and started.acquire(timeout=30)   # both workers mid-load
+    replicator.cancel(reason="SIGTERM")
+    thread.join(timeout=30)
+    summary = result["summary"]
+    assert len(cancelled) == 2, out.getvalue()
+    assert summary.status == "interrupted" and summary.exit_code == EXIT_INTERRUPTED
+    assert "Views skipped: the run was interrupted (SIGTERM)" in out.getvalue()
+    assert target_query(paths=paths, sql="SELECT status FROM _adbc_replicate.run_log")[0][0] == "interrupted"

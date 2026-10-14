@@ -9,7 +9,7 @@ import hashlib
 import threading
 import time
 import uuid
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 
 from . import __version__
@@ -30,6 +30,7 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_CONFIG = 2
 EXIT_VIEW_ERRORS = 3
+EXIT_INTERRUPTED = 130      # the CLI reports 128 + the signal number (130 SIGINT, 143 SIGTERM)
 
 PROGRESS_EVERY_SECONDS = 30.0
 
@@ -74,6 +75,35 @@ class Replicator:
         self._stop = threading.Event()
         self._worker_connections: list = []
         self._worker_lock = threading.Lock()
+        self._inflight: set = set()          # cursors with a statement running, cancelled by cancel()
+        self.interrupted: str | None = None   # set by cancel(): why the run is stopping (e.g. "SIGTERM")
+
+    # ---- cancellation ---------------------------------------------------------------------
+
+    @contextmanager
+    def track(self, cursor):
+        """Register a cursor while its statement runs, so cancel() can interrupt it."""
+        with self._worker_lock:
+            self._inflight.add(cursor)
+        try:
+            if self.interrupted:
+                raise RuntimeError(f"run interrupted ({self.interrupted})")
+            yield cursor
+        finally:
+            with self._worker_lock:
+                self._inflight.discard(cursor)
+
+    def cancel(self, reason: str) -> None:
+        """Stop the run from another thread (a signal handler): no new tables start, and every
+        statement in flight, in any worker, is cancelled, so its target transaction rolls back and
+        no server session is left holding locks."""
+        self.interrupted = reason
+        self._stop.set()
+        with self._worker_lock:
+            cursors = list(self._inflight)
+        for cursor in cursors:
+            with suppress(Exception):
+                cursor.adbc_cancel()
 
     # ---- helpers --------------------------------------------------------------------------
 
@@ -121,7 +151,9 @@ class Replicator:
         sql = self.source.fingerprint_sql(task=task)
         if sql is None:
             return None, None
-        rows = self.source.fetch_all(conn=conn, sql=sql)
+        with conn.cursor() as cur, self.track(cursor=cur):
+            cur.execute(operation=sql)
+            rows = cur.fetchall()
         count, fingerprint = rows[0]
         return int(float(count)), (str(fingerprint) if fingerprint is not None else None)
 
@@ -188,7 +220,7 @@ class Replicator:
             try:
                 return self._copy(task=task, sconn=sconn, tconn=tconn, exists_as_view=exists_as_view)
             except Exception as e:
-                if attempt == retries or not is_transient(error=e) or self._stop.is_set():
+                if attempt == retries or not is_transient(error=e) or self._stop.is_set() or self.interrupted:
                     raise
                 with suppress(Exception):
                     tconn.rollback()
@@ -218,7 +250,7 @@ class Replicator:
                 self.emit("table_progress", f"     ⏳ {name}: {fmt_rows(copied)} rows ({fmt_seconds(now - started)})",
                           table=name, rows=copied, seconds=round(now - started, 1))
 
-        with sconn.cursor() as cur:
+        with sconn.cursor() as cur, self.track(cursor=cur):
             self.source.prepare_cursor(cursor=cur)
             cur.execute(operation=sql)
             reader = cur.fetch_record_batch()
@@ -227,7 +259,8 @@ class Replicator:
             reader = coalesce(reader=reader, max_rows=self.config.ingest.batch_rows,
                               max_bytes=self.config.ingest.batch_bytes)
             reader = counting(reader=reader, on_batch=progress)
-            self.target.ingest(conn=tconn, db_schema=task.target_db_schema, table=task.target_table, reader=reader)
+            self.target.ingest(conn=tconn, db_schema=task.target_db_schema, table=task.target_table, reader=reader,
+                               track=self.track)
         tconn.commit()
         return copied
 
@@ -509,7 +542,10 @@ class Replicator:
 
             view_failures: dict[str, str] = {}
             views_created = views_skipped = 0
-            if self.options.skip_views:
+            if self.interrupted:
+                self.emit("views_skipped", f"🪟 Views skipped: the run was interrupted ({self.interrupted})",
+                          level="warning")
+            elif self.options.skip_views:
                 self.emit("views_skipped", "🪟 Views skipped (--skip-views)")
             elif failed and self.config.on_table_error == "abort":
                 self.emit("views_skipped", "🪟 Views skipped: a table failed, so they'd be built on incomplete data",
@@ -527,7 +563,7 @@ class Replicator:
                     self.emit("view_failed", f"  ❌ {name}: {error}", level="error", view=name, error=error)
             stats.update(views_created=views_created, views_skipped=views_skipped, views_failed=len(view_failures))
 
-            if self.config.target.checkpoint and (copied or views_created):
+            if self.config.target.checkpoint and (copied or views_created) and not self.interrupted:
                 error = self.target.checkpoint(conn=target_conn)
                 if error:
                     self.emit("warning", f"⚠️  CHECKPOINT after load failed: {error}", level="warning")
@@ -537,13 +573,15 @@ class Replicator:
             with suppress(Exception):
                 source_conn.close()
 
-        if table_failures:
+        if self.interrupted:
+            status, code = "interrupted", EXIT_INTERRUPTED
+        elif table_failures:
             status, code = "failed", EXIT_FAILED
         elif view_failures:
             status, code = "completed_with_view_errors", EXIT_VIEW_ERRORS
         else:
             status, code = "completed", EXIT_OK
-        icon = {"completed": "🏁", "completed_with_view_errors": "⚠️ ", "failed": "💥"}[status]
+        icon = {"completed": "🏁", "completed_with_view_errors": "⚠️ ", "failed": "💥", "interrupted": "🛑"}[status]
         self.emit("run_finished", f"{icon} Run {status.replace('_', ' ')}", status=status, run_id=run_id, **stats)
         return RunSummary(run_id=run_id, status=status, stats=stats, view_failures=view_failures,
                           table_failures=table_failures, exit_code=code)

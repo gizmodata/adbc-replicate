@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sys
+import threading
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -75,7 +78,7 @@ def run(config_path, env_file, full_refresh, row_limit, only, parallelism, skip_
                             options=RunOptions(full_refresh=full_refresh, row_limit=row_limit, only=list(only),
                                                parallelism=parallelism, skip_views=skip_views))
     try:
-        summary = replicator.run()
+        summary, signum = _run_interruptibly(replicator=replicator, reporter=reporter)
     except PlanError as e:
         reporter.emit(event="run_failed", text=f"❌ {e}", level="error", error=str(e))
         sys.exit(EXIT_CONFIG)
@@ -85,7 +88,44 @@ def run(config_path, env_file, full_refresh, row_limit, only, parallelism, skip_
         sys.exit(EXIT_FAILED)
     reporter.emit(event="elapsed", text=f"⏱️  {fmt_seconds(time.monotonic() - started)}",
                   seconds=round(time.monotonic() - started, 2))
-    sys.exit(summary.exit_code)
+    sys.exit(128 + signum if signum else summary.exit_code)
+
+
+def _run_interruptibly(replicator: Replicator, reporter: Reporter):
+    """Run on a worker thread so the main thread can act on SIGINT/SIGTERM at once: cancel every
+    in-flight statement (any worker), let the run roll back, record and notify, then exit 130/143.
+    (Killed outright, the target's server sessions would keep their transactions open; Kubernetes
+    sends SIGTERM when it evicts a pod.) A second signal exits immediately."""
+    outcome: dict = {}
+
+    def work() -> None:
+        try:
+            outcome["summary"] = replicator.run()
+        except BaseException as e:   # re-raised on the main thread
+            outcome["error"] = e
+
+    def on_signal(signum, frame) -> None:
+        name = signal.Signals(signum).name
+        if "signum" in outcome:
+            reporter.emit(event="interrupted", text=f"🛑 {name} again: exiting now", level="error", signal=name)
+            os._exit(128 + signum)
+        outcome["signum"] = signum
+        reporter.emit(event="interrupted", text=f"🛑 {name}: cancelling the statements in flight, then stopping…",
+                      level="warning", signal=name)
+        replicator.cancel(reason=name)
+
+    previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        worker = threading.Thread(target=work, name="adbc-replicate-run", daemon=True)
+        worker.start()
+        while worker.is_alive():
+            worker.join(timeout=0.25)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["summary"], outcome.get("signum")
 
 
 @main.command()

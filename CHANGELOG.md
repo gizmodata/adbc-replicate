@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Stopping a run (SIGINT, or the SIGTERM Kubernetes sends when it evicts a pod) cancelled at most
+  the main thread's statement, or none: killed mid-load, the process left GizmoSQL sessions
+  holding open transactions, and the next run's replace of those tables failed with "Catalog
+  write-write conflict". Now every in-flight statement in every worker is cancelled, the run is
+  logged as `interrupted` (exit 130/143) and notifications fire.
+
 ## [0.2.0] - 2026-10-14
 
 ### Added

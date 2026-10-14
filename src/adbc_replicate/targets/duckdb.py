@@ -8,6 +8,7 @@ transaction, so readers keep seeing the previous copy of a table until the new o
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 
 import pyarrow as pa
 
@@ -114,8 +115,10 @@ class DuckDBFamilyTarget:
     def drop(self, conn, db_schema: str, name: str, kind: str) -> None:
         self.execute(conn=conn, sql=f"DROP {kind} IF EXISTS {self.qualified(db_schema=db_schema, name=name)}")
 
-    def ingest(self, conn, db_schema: str, table: str, reader: pa.RecordBatchReader) -> int:
-        with conn.cursor() as cur:
+    def ingest(self, conn, db_schema: str, table: str, reader: pa.RecordBatchReader, track=None) -> int:
+        """Bulk-load `reader` into a new copy of the table. `track(cursor)` (a context manager) lets the
+        caller cancel the load from another thread."""
+        with conn.cursor() as cur, (track(cursor=cur) if track else nullcontext()):
             rows = cur.adbc_ingest(table_name=table, data=reader, mode="replace",
                                    catalog_name=self.catalog, db_schema_name=db_schema)
         return rows
