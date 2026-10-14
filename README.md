@@ -559,6 +559,14 @@ tests on Python 3.11–3.14, the oldest allowed dependency versions, integration
 real GizmoSQL, Oracle and PostgreSQL (also on Python 3.15), Snowflake, a Docker end-to-end run
 and the Helm chart — on the tagged commit before anything is published.
 
+## 🙏 Inspiration
+
+Hat tip to [Fletch](https://github.com/early-signal-tech/fletch) by
+[Early Signal](https://www.earlysignal.tech/), a Go data transfer tool built on ADBC (see Hoyt
+Emerson's [*Building My First Data Tool With ADBC*](https://thefulldatastack.substack.com/p/building-my-first-data-tool-with)).
+It showed how pleasant a small ADBC-to-ADBC command line with friendly emoji output can be,
+and adbc-replicate's CLI style owes it a nod. No code is shared between the projects.
+
 ## Trademarks
 
 Oracle is a registered trademark of Oracle Corporation; Snowflake is a trademark of
