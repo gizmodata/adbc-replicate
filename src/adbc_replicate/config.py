@@ -297,6 +297,26 @@ class StateConfig(_Model):
                            description="Target db_schema holding sync state and the run log.")
 
 
+class NotificationConfig(_Model):
+    url: str = Field(description="Webhook URL, e.g. a Slack incoming webhook. It is a secret: reference it as "
+                                 "${VAR}. Only its host is ever printed.")
+    when: list[Literal["success", "failure", "view_errors"]] = Field(
+        default_factory=lambda: ["failure", "view_errors"],
+        description="Run outcomes that trigger it: failure (exit 1 or 2, including config and connection "
+                    "errors), view_errors (exit 3) and success (exit 0).",
+    )
+    format: Literal["slack", "json"] = Field(
+        default="slack",
+        description="slack: a Slack Block Kit message. json: the run summary as JSON, for any other receiver.",
+    )
+    include_errors: bool = Field(
+        default=True,
+        description="Include error messages (clipped). Source errors can quote data values (e.g. a number "
+                    "that didn't fit); set false to send only object names and counts.",
+    )
+    timeout_seconds: float = Field(default=10.0, gt=0, description="Per attempt; one retry on a 5xx or no answer.")
+
+
 class ReplicationConfig(_Model):
     version: Literal[1] = Field(description="Config format version.")
     name: str | None = Field(default=None, description="A label for this replication, recorded in the run log.")
@@ -309,6 +329,8 @@ class ReplicationConfig(_Model):
     refresh: RefreshConfig = Field(default_factory=RefreshConfig)
     ingest: IngestConfig = Field(default_factory=IngestConfig)
     state: StateConfig = Field(default_factory=StateConfig)
+    notifications: list[NotificationConfig] = Field(
+        default_factory=list, description="Webhooks called when a run finishes (Slack or JSON).")
     parallelism: int = Field(default=1, ge=1, le=64, description="Tables copied at once.")
     on_table_error: Literal["abort", "continue"] = Field(
         default="abort",

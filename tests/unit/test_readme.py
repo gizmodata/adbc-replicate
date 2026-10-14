@@ -21,7 +21,8 @@ BASE = {
 @pytest.fixture(autouse=True)
 def env(monkeypatch):
     for name in ("PGPASSWORD", "PGUSER", "GIZMOSQL_PASSWORD", "GIZMOSQL_USERNAME", "ORACLE_USERNAME",
-                 "ORACLE_PASSWORD", "SNOWFLAKE_ACCOUNT", "SNOWFLAKE_PRIVATE_KEY", "MASK_SALT"):
+                 "ORACLE_PASSWORD", "SNOWFLAKE_ACCOUNT", "SNOWFLAKE_PRIVATE_KEY", "MASK_SALT", "SLACK_WEBHOOK_URL",
+                 "OPS_WEBHOOK_URL", "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE"):
         monkeypatch.setenv(name, "x")
 
 

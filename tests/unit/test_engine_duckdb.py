@@ -337,3 +337,107 @@ def test_rename_of_a_missing_column_fails_the_plan(paths):
     config = make_config(paths=paths, columns=[{"tables": ["hr.employees"], "rename": {"NAEM": "x"}}])
     with pytest.raises(PlanError, match=r"columns\[0\]\.rename pattern 'NAEM'"):
         run(config=config)
+
+
+@pytest.fixture
+def webhook():
+    """A local HTTP server standing in for Slack: records each POSTed JSON body; status via .status."""
+    import http.server
+    import threading
+    import typing
+
+    class Hook:
+        status = 200
+        bodies: typing.ClassVar[list] = []
+        paths: typing.ClassVar[list] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            Hook.bodies.append(json.loads(self.rfile.read(length)))
+            Hook.paths.append(self.path)
+            self.send_response(Hook.status)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    Hook.bodies, Hook.paths = [], []
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    Hook.url = f"http://127.0.0.1:{server.server_address[1]}/services/T000/B000/SECRET-TOKEN"
+    yield Hook
+    server.shutdown()
+
+
+def test_failure_notifies_slack_with_the_failed_tables(paths, webhook, monkeypatch):
+    from adbc_replicate.targets.duckdb import DuckDBFamilyTarget
+
+    def broken_ingest(self, conn, db_schema, table, reader):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(DuckDBFamilyTarget, "ingest", broken_ingest)
+    config = make_config(paths=paths, name="nightly-hr", notifications=[{"url": webhook.url}])
+    summary, out = run(config=config, skip_views=True)
+    assert summary.exit_code == EXIT_FAILED
+    assert len(webhook.bodies) == 1
+    body = webhook.bodies[0]
+    assert body["text"] == "❌ nightly-hr: replication FAILED"
+    text = json.dumps(body["blocks"])
+    assert "Table failures (1)" in text and "disk full" in text and "1 failed" in text
+    assert "📣 Notified 127.0.0.1" in out and "SECRET-TOKEN" not in out
+
+
+def test_when_selects_outcomes_and_json_format_carries_the_summary(paths, webhook):
+    config = make_config(paths=paths, name="nightly-hr", notifications=[
+        {"url": webhook.url},                                                    # default: failure, view_errors
+        {"url": webhook.url + "/json", "when": ["success", "failure"], "format": "json"}])
+    summary, _ = run(config=config, skip_views=True)
+    assert summary.exit_code == EXIT_OK
+    assert webhook.paths == ["/services/T000/B000/SECRET-TOKEN/json"]           # only the success subscriber
+    body = webhook.bodies[0]
+    assert body["outcome"] == "success" and body["exit_code"] == 0 and body["replication"] == "nightly-hr"
+    assert body["stats"]["tables_copied"] == 2 and body["run_id"] == summary.run_id
+
+
+def test_view_errors_and_plan_errors_notify(paths, webhook):
+    summary, _ = run(config=make_config(paths=paths, notifications=[{"url": webhook.url, "format": "json"}]))
+    assert summary.exit_code == EXIT_VIEW_ERRORS and webhook.bodies[-1]["outcome"] == "view_errors"
+    assert "hr.v_orders" in webhook.bodies[-1]["view_failures"]
+    bad = make_config(paths=paths, columns=[{"tables": ["hr.employees"], "mask": {"SNN": "hash"}}],
+                      notifications=[{"url": webhook.url, "format": "json"}])
+    with pytest.raises(PlanError):
+        run(config=bad)
+    assert webhook.bodies[-1]["outcome"] == "failure" and webhook.bodies[-1]["exit_code"] == 2
+    assert "SNN" in webhook.bodies[-1]["error"]
+
+
+def test_connection_failure_still_notifies(paths, webhook, tmp_path):
+    config = make_config(paths={**paths, "target": str(tmp_path / "missing-dir" / "t.duckdb")},
+                         notifications=[{"url": webhook.url, "format": "json"}])
+    with pytest.raises(Exception):  # noqa: B017 - any connection error
+        run(config=config)
+    assert webhook.bodies[-1]["outcome"] == "failure" and webhook.bodies[-1]["error"]
+
+
+def test_a_broken_webhook_never_fails_the_run(paths, webhook, monkeypatch):
+    import adbc_replicate.notify as notify
+    monkeypatch.setattr(notify.time, "sleep", lambda s: None)
+    webhook.status = 500
+    summary, out = run(config=make_config(paths=paths, notifications=[{"url": webhook.url, "when": ["success"]}]),
+                       skip_views=True)
+    assert summary.exit_code == EXIT_OK
+    assert len(webhook.bodies) == 2                                              # one retry on a 5xx
+    assert "Notification to 127.0.0.1" in out and "HTTP 500" in out and "SECRET-TOKEN" not in out
+
+
+def test_cli_test_notifications(paths, webhook, tmp_path):
+    import yaml
+    cfg = tmp_path / "replicate.yaml"
+    data = make_config(paths=paths, name="nightly-hr", notifications=[{"url": webhook.url}]).model_dump(
+        mode="json", exclude_none=True)
+    cfg.write_text(yaml.safe_dump(data), encoding="utf-8")
+    result = CliRunner().invoke(main, ["test-notifications", "--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert webhook.bodies[-1]["text"] == "🧪 nightly-hr: test notification"

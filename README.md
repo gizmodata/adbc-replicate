@@ -212,6 +212,7 @@ Extras: `oracle`, `postgresql`, `snowflake`, `gizmosql`, `duckdb`, `all`. On Pyt
 | `adbc-replicate test-connection --config CONFIG` | Connect to the source and target and report what each sees. |
 | `adbc-replicate plan --config CONFIG [--show-sql] [--format json]` | Show what a run would copy, the target names, excluded and masked columns, and whether each view translates. Connects to the source only. |
 | `adbc-replicate run --config CONFIG` | Replicate. Options: `--full-refresh`, `--row-limit N`, `--tables 'HR.EMP*'` (repeatable), `--parallelism N`, `--skip-views`, `--log-format json`, `--quiet`. |
+| `adbc-replicate test-notifications --config CONFIG` | Send a test message to every configured webhook. |
 | `adbc-replicate schema` | Print the config's JSON Schema. |
 
 `--config` has the short form `-c`, and `--quiet` has `-q`. `--env-file .env` (or `DOTENV_PATH`) loads environment variables first; existing variables win.
@@ -365,6 +366,26 @@ views:
 
 A view that calls a source-only function (PL/SQL, `SYS_CONTEXT`) can't be translated; list it
 in `objects[].materialize_views` to copy its rows instead (column rules still apply).
+
+### Notifications: Slack or any webhook
+
+```yaml
+notifications:
+  - url: ${SLACK_WEBHOOK_URL}          # a Slack incoming webhook; the URL is a secret
+    when: [failure, view_errors]       # default; add success for a daily "all good"
+  - url: ${OPS_WEBHOOK_URL}
+    when: [failure, view_errors, success]
+    format: json                       # the run summary as JSON, for any other receiver
+    include_errors: false              # names and counts only (errors can quote source values)
+```
+
+When a run finishes, each webhook whose `when` matches the outcome is called: `failure`
+(exit 1 or 2, including config, plan and connection errors), `view_errors` (exit 3) or
+`success` (exit 0). The Slack message carries the outcome, table/row/view counts, the
+duration, the consistent-read point and the first failures with their (clipped) errors. A
+webhook that can't be reached is retried once and then reported as a warning; it never fails
+the replication, and only the URL's host is ever printed. `adbc-replicate test-notifications
+--config replicate.yaml` sends a test message to every webhook.
 
 ### Everything else
 

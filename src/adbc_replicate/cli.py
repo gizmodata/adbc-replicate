@@ -202,6 +202,38 @@ def plan(config_path, env_file, fmt, show_sql, only) -> None:
                   if failing else ""))
 
 
+@main.command("test-notifications")
+@CONFIG_OPTION
+@ENV_FILE_OPTION
+def test_notifications(config_path, env_file) -> None:
+    """Send a test message to every configured webhook (whatever its `when`)."""
+    import datetime
+
+    from .notify import TEST, build_payload, deliver
+
+    try:
+        config = _load(config_path=config_path, env_file=env_file)
+    except ConfigError as e:
+        _fail(message=str(e))
+    if not config.notifications:
+        _fail(message="the config has no notifications")
+    failed = []
+    reporter = Reporter(fmt="text")
+
+    def emit(event, text=None, **fields):
+        if event == "notification_failed":
+            failed.append(fields.get("host"))
+        reporter.emit(event=event, text=text, **fields)
+
+    payload = build_payload(outcome=TEST, exit_code=EXIT_OK, run_id=None, replication=config.name,
+                            source=config.source.type, target=config.target.type,
+                            catalog=getattr(config.target, "catalog", None),
+                            started_at=datetime.datetime.now(tz=datetime.UTC), seconds=0.0, stats={},
+                            table_failures={}, view_failures={}, error=None)
+    deliver(notifications=config.notifications, payload=payload, emit=emit)
+    sys.exit(EXIT_FAILED if failed else EXIT_OK)
+
+
 @main.command("test-connection")
 @CONFIG_OPTION
 @ENV_FILE_OPTION

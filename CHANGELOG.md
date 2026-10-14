@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Webhook notifications when a run finishes: `notifications:` with a Slack Block Kit message
+  or a JSON run summary, chosen per webhook by outcome (`when: [failure, view_errors,
+  success]`). Runs that fail before or while connecting notify too; an unreachable webhook is
+  a warning, never a failed run; URLs are never printed. `adbc-replicate test-notifications`
+  sends a test message.
+
 - Retries on transient connection errors (gRPC "unavailable", such as "the connection is
   draining" when an nginx in front of GizmoSQL reloads). A table load is retried whole
   (`ingest.retries`, default 2, with `ingest.retry_wait_seconds` backoff); that's safe because

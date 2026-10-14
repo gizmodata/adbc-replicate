@@ -4,6 +4,7 @@ views, and record everything in the target's sync state."""
 from __future__ import annotations
 
 import concurrent.futures
+import datetime
 import hashlib
 import threading
 import time
@@ -17,7 +18,8 @@ from .config import ReplicationConfig
 from .events import Reporter, fmt_rows, fmt_seconds
 from .matching import TablePatternSet
 from .models import Plan, TableResult, TableTask, ViewTask
-from .planner import build_plan
+from .notify import build_payload, deliver, outcome_of
+from .planner import PlanError, build_plan
 from .sources import make_source
 from .state import StateStore, column_signature
 from .targets import make_target
@@ -392,8 +394,35 @@ class Replicator:
     # ---- the run --------------------------------------------------------------------------
 
     def run(self) -> RunSummary:
+        """Run the replication, then call the configured webhooks with the outcome (also when the run
+        fails before or while connecting)."""
         run_id = str(uuid.uuid4())
         stats: dict = {}
+        started_at, started = datetime.datetime.now(tz=datetime.UTC), time.monotonic()
+        summary, error, exit_code = None, None, EXIT_FAILED
+        try:
+            summary = self._recorded_run(run_id=run_id, stats=stats)
+            exit_code = summary.exit_code
+            return summary
+        except PlanError as e:
+            error, exit_code = str(e), EXIT_CONFIG
+            raise
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            raise
+        finally:
+            if self.config.notifications:
+                payload = build_payload(
+                    outcome=outcome_of(exit_code=exit_code), exit_code=exit_code, run_id=run_id,
+                    replication=self.config.name, source=self.config.source.type, target=self.config.target.type,
+                    catalog=self.target.catalog, started_at=started_at, seconds=time.monotonic() - started,
+                    stats=summary.stats if summary else stats,
+                    table_failures=summary.table_failures if summary else {},
+                    view_failures=summary.view_failures if summary else {}, error=error,
+                    include_errors=all(n.include_errors for n in self.config.notifications))
+                deliver(notifications=self.config.notifications, payload=payload, emit=self.emit)
+
+    def _recorded_run(self, run_id: str, stats: dict) -> RunSummary:
         snapshot_desc = None
         refresh_mode = "full" if (self.options.full_refresh or self.config.refresh.mode == "full") else "changed"
         target_conn = self.target.connect()
