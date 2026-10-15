@@ -139,7 +139,7 @@ adbc-replicate run --config replicate.yaml
 
 ✨ 2 table(s) to copy, 1 view(s) ready
 
-🚀 adbc-replicate 0.4.0: postgresql → gizmosql (catalog warehouse), run d01f7406-94ea-4517-8dfe-d14ab79b5da3
+🚀 adbc-replicate 0.5.0: postgresql → gizmosql (catalog warehouse), run d01f7406-94ea-4517-8dfe-d14ab79b5da3
 📸 Consistent read: exported snapshot 00000003-00000032-1
 🔍 Discovering source objects…
 🗺️  2 table(s) and 1 view(s) selected (0.0s)
