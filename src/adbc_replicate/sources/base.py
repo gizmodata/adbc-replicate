@@ -183,10 +183,28 @@ class Source(ABC):
                                     list(constraint["constraint_column_names"])
         return keys
 
+    #: True when the source itself can name the rows changed since a point (Oracle ORA_ROWSCN);
+    #: other sources need refresh.watermark_column for incremental loads.
+    tracks_row_changes: bool = False
+
     def change_token(self) -> str | None:
         """Where this run's reads stand (e.g. the snapshot SCN); None if the source can't tell
         which rows changed, so incremental tables fall back to whole-table copies."""
         return None
+
+    def watermark_sql(self, task: TableTask) -> str:
+        """One row, one text value: the highest task.watermark_column value now (NULL when empty)."""
+        col = self.quote(name=task.watermark_column)
+        return f"SELECT CAST(MAX({col}) AS VARCHAR(64)) FROM {self.table_ref(obj=task.source)}"
+
+    def watermark_filter(self, task: TableTask, previous: str, lookback_minutes: int) -> str:
+        """Rows stamped after `previous` minus the lookback (a superset is fine: rows are merged)."""
+        col = self.quote(name=task.watermark_column)
+        return (f"{col} > CAST({quote_literal(value=previous)} AS TIMESTAMP) "
+                f"- INTERVAL '{int(lookback_minutes)}' MINUTE")
+
+    def count_sql(self, task: TableTask) -> str:
+        return f"SELECT COUNT(*) FROM {self.table_ref(obj=task.source)}"
 
     def incremental_filter(self, previous_token: str) -> str | None:
         """A WHERE condition selecting the rows changed since `previous_token` (a superset is fine:

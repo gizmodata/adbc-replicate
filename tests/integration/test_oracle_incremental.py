@@ -106,11 +106,13 @@ def test_incremental_merges_changes_and_deletes(inc_source, gizmosql, prefix):
     assert summary.stats["rows_deleted"] == 0, out
     assert_identical(source=source, gizmosql=gizmosql, prefix=prefix)
 
-    # without delete detection, a deleted source row stays in the target
+    # without delete detection, the row-count check notices the deleted row and copies the table whole
     execute(conn=inc_source, statements=[f"DELETE FROM {SCHEMA}.orders WHERE id = 78", "COMMIT"])
     summary, out = run(config=config(prefix=prefix, detect_deletes=False))
-    assert summary.stats.get("rows_deleted", 0) == 0, out
-    assert query(conn=gizmosql, sql=f"SELECT count(*) FROM {prefix}_inc.orders WHERE id = 78")[0][0] == 1
+    assert summary.exit_code == EXIT_OK and summary.stats.get("rows_deleted", 0) == 0, out
+    assert "INCSRC.ORDERS: " in out and "copying it whole" in out, out
+    assert query(conn=gizmosql, sql=f"SELECT count(*) FROM {prefix}_inc.orders WHERE id = 78")[0][0] == 0
+    assert_identical(source=source, gizmosql=gizmosql, prefix=prefix)
     source.close()
 
 

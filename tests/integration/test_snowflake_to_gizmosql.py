@@ -108,3 +108,24 @@ def test_snowflake_snapshot_is_refused_on_a_shared_database(gizmosql, prefix):
     with pytest.raises(PlanError, match=r"SNOWFLAKE_SAMPLE_DATA is a shared \(imported\) database"):
         run(config=config(prefix=prefix, consistency="snapshot"))
     assert query(conn=gizmosql, sql=f"SELECT count(*) FROM duckdb_tables() WHERE schema_name = '{prefix}_s'")[0][0] == 0
+
+
+def test_snowflake_watermark_merge(snowflake, gizmosql, prefix):
+    # Snowflake has no row change tracking we can rely on (it's off unless the owner enables it), so
+    # incremental loads use a watermark column and a configured key. The sample share never changes,
+    # so the state's change marker is cleared to make the second run take the merge path: it reads
+    # the rows within the lookback of the highest O_ORDERDATE, merges them, and the counts agree.
+    refresh = {"mode": "incremental", "keys": {"TPCH_SF1.ORDERS": ["O_ORDERKEY"]},
+               "watermark_column": "O_ORDERDATE", "watermark_lookback_minutes": 2880, "detect_deletes": False}
+    cfg = config(prefix=prefix, tables=["ORDERS"], refresh=refresh)
+    summary, out = run(config=cfg)
+    assert summary.exit_code == EXIT_OK and summary.stats["tables_copied"] == 1, out
+    watermark = query(conn=gizmosql, sql=f"SELECT change_token FROM {prefix}_state.table_state")[0][0]
+    assert watermark.startswith("1998-08-02"), watermark       # MAX(O_ORDERDATE) in TPCH_SF1
+    query(conn=gizmosql, sql=f"UPDATE {prefix}_state.table_state SET change_marker = NULL")
+    summary, out = run(config=cfg)
+    assert summary.exit_code == EXIT_OK and summary.stats["tables_merged"] == 1, out
+    expected = query(conn=snowflake, sql=f"SELECT COUNT(*) FROM {CATALOG}.TPCH_SF1.ORDERS "
+                                         "WHERE O_ORDERDATE > DATEADD(day, -2, '1998-08-02'::DATE)")[0][0]
+    assert f"{int(expected):,} changed rows merged" in out, out
+    assert query(conn=gizmosql, sql=f"SELECT count(*) FROM {prefix}_s.orders")[0][0] == 1_500_000

@@ -368,10 +368,42 @@ How a source tells which rows changed:
   it never misses a transaction that commits late (also on RAC, where sequence caches make IDs
   arrive out of order). Unless a table was created with `ROWDEPENDENCIES` it's tracked per
   block, so some unchanged rows come along; the merge makes that harmless.
-- **Other sources** have no change tracking yet: their tables behave as in `changed` mode.
+- **Other sources (Snowflake, PostgreSQL, DuckDB)** can't name changed rows themselves (Snowflake
+  change tracking is off by default and needs the table owner). For them, name a
+  **watermark column**: a timestamp that every write stamps on the rows it inserts or updates,
+  such as dbt's `DBT_RUN_STARTED_AT`. Each run reads the rows stamped after the previous run's
+  highest value, minus `watermark_lookback_minutes` (for writers that commit out of stamp order),
+  and merges them on the key.
+
+```yaml
+refresh:
+  mode: incremental
+  watermark_column: DBT_RUN_STARTED_AT
+  watermark_lookback_minutes: 360   # default: re-read 6 h before the last stamp seen
+  detect_deletes: false             # dbt merges never delete: check row counts instead (below)
+  keys:                             # for tables whose source declares no primary key
+    ANALYTICS.FACT_ORDERS: [ORDER_ID]                 # e.g. the dbt model's unique_key
+    ANALYTICS.ORDER_LINES: [ORDER_ID, LINE_NUMBER]
+  append:                           # keyless tables that only ever gain rows: insert, don't merge
+    - ANALYTICS.WEB_EVENTS
+```
+
+`keys` supplies merge keys where the source has none, or overrides a declared one. Snowflake keys
+are optional and never enforced, and dbt keeps a model's `unique_key` to itself. `append` is for
+keyless tables that only grow, such as dbt incremental models without a `unique_key`, which dbt
+`INSERT`s into. Their newly stamped rows are appended, with no lookback, since a re-read would
+duplicate rows.
+
+Without delete detection, each merge or append ends by comparing the target's row count with the
+source's. A mismatch rolls the merge back and copies the table whole: that happens after a delete in
+the source, after a dbt full refresh restamps every row of an append table, or when the merge key
+turns out not to be unique among the changed rows.
 
 The first incremental run copies each table whole (or confirms it unchanged) and records where
-it stood; later runs merge. Tables without a usable key keep `changed`-mode behavior.
+it stood; later runs merge. Tables without a usable key keep `changed`-mode behavior. Keep the
+watermark for tables whose writes touch a few rows at a time: when every write restamps every row
+(dbt `table` models, which are rebuilt whole), a merge rereads the whole table, while
+`changed` mode would skip it when the fingerprint is unchanged.
 
 ### Views
 
@@ -639,6 +671,17 @@ config:
 ```
 
 Run it now with `kubectl create job --from=cronjob/erp-replication-adbc-replicate manual-1`.
+
+Two alternatives suit a deploy repo that keeps one config file and one `.env` for both the CLI
+and the cluster. `configFile` takes the config file as it is, comments included, instead of
+`values.config`. `dotenv` takes a whole dotenv file, which the chart stores in a Secret, mounts
+at `/secrets/.env` and loads through `DOTENV_PATH`. Variables already in the environment win
+over it. Use `dotenvSecret.name` / `.key` to point at an existing Secret that holds the file.
+
+```bash
+helm upgrade --install erp-replication oci://ghcr.io/gizmodata/charts/adbc-replicate \
+  --values values.yaml --set-file configFile=replicate.yaml --set-file dotenv=.env
+```
 
 ## 📒 Run history
 

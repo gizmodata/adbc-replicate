@@ -25,7 +25,7 @@ classifiers = [
 dependencies = [
     "adbc-driver-manager>=1.12.0",
     "pyarrow>=26.0.0",
-    "sqlglot>=30.22.0",
+    "sqlglot>=30.23.0",
     "pydantic>=2.14.1",
     "pyyaml>=6.0.3",
     "click>=8.5.0",
@@ -35,16 +35,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-oracle = ["adbc-driver-oracle>=1.0.0"]
+oracle = ["adbc-driver-oracle>=1.0.1"]
 postgresql = ["adbc-driver-postgresql>=1.12.0"]
 snowflake = ["adbc-driver-snowflake>=1.11.0"]
-gizmosql = ["adbc-driver-gizmosql>=2.0.14"]
+gizmosql = ["adbc-driver-gizmosql>=2.0.15"]
 duckdb = ["duckdb>=1.5.6,<2"]
 all = [
-    "adbc-driver-oracle>=1.0.0",
+    "adbc-driver-oracle>=1.0.1",
     "adbc-driver-postgresql>=1.12.0",
     "adbc-driver-snowflake>=1.11.0",
-    "adbc-driver-gizmosql>=2.0.14",
+    "adbc-driver-gizmosql>=2.0.15",
     # DuckDB publishes no Python 3.15 wheels yet (building it from source takes ~30 min)
     "duckdb>=1.5.6,<2; python_version < '3.15'",
 ]

@@ -99,6 +99,32 @@ def _incremental_key(task: TableTask) -> tuple[list[str] | None, str | None]:
     return [selected[name].target_name for name in key], None
 
 
+def _configured_key(obj: SourceObject, keys: list, used: set[str]) -> list[str] | None:
+    """The refresh.keys entry for a table (first matching pattern), as the source's column names."""
+    for patterns, pattern, columns in keys:
+        if patterns.matches_table(schema=obj.db_schema, table=obj.name):
+            used.add(pattern)
+            by_upper = {c.name.upper(): c.name for c in obj.columns}
+            missing = [c for c in columns if c.upper() not in by_upper]
+            if missing:
+                raise PlanError(f"refresh.keys[{pattern!r}]: {obj.qualified_name} has no column(s) "
+                                f"{', '.join(missing)}")
+            return [by_upper[c.upper()] for c in columns]
+    return None
+
+
+def _watermark(task: TableTask, column: str | None) -> tuple[str | None, str | None]:
+    """The source column marking changed rows for a keyed table, or why it has none."""
+    if not column:
+        return None, "the source can't tell which rows changed (set refresh.watermark_column)"
+    found = next((c for c in task.source.columns if c.name.upper() == column.upper()), None)
+    if found is None:
+        return None, f"no {column.upper()} column (refresh.watermark_column)"
+    if "TIMESTAMP" not in found.data_type and found.data_type != "DATE":
+        return None, f"{found.name} is {found.data_type}, not a timestamp (refresh.watermark_column)"
+    return found.name, None
+
+
 def build_plan(config: ReplicationConfig, source, conn) -> Plan:
     case = config.naming.case
     plan = Plan(tables=[], views=[])
@@ -107,6 +133,11 @@ def build_plan(config: ReplicationConfig, source, conn) -> Plan:
     object_cache: dict[tuple[str | None, tuple[str, ...]], list[SourceObject]] = {}
 
     candidates: list[tuple[SourceObject, str, str, str]] = []   # (obj, role, target_db_schema, target_name)
+    config_keys = [(TablePatternSet(patterns=[pattern]), pattern, columns)
+                   for pattern, columns in config.refresh.keys.items()]
+    used_keys: set[str] = set()
+    append = TablePatternSet(patterns=config.refresh.append)
+    used_append: set[str] = set()
     for index, rule in enumerate(config.objects):
         source.check_catalog(conn=conn, catalog=rule.catalog)
         if rule.catalog not in schema_cache:
@@ -125,6 +156,9 @@ def build_plan(config: ReplicationConfig, source, conn) -> Plan:
                 keys = source.primary_keys(conn=conn, catalog=rule.catalog, db_schemas=db_schemas)
                 for obj in object_cache[key]:
                     obj.primary_key = keys.get((obj.db_schema, obj.name))
+                    configured = _configured_key(obj=obj, keys=config_keys, used=used_keys)
+                    if configured is not None:
+                        obj.primary_key = configured
 
         tables, exclude_tables = PatternSet(patterns=rule.tables), PatternSet(patterns=rule.exclude_tables)
         views, exclude_views = PatternSet(patterns=rule.views), PatternSet(patterns=rule.exclude_views)
@@ -201,12 +235,26 @@ def build_plan(config: ReplicationConfig, source, conn) -> Plan:
                              columns=columns, excluded_columns=excluded, note=note)
             if config.refresh.mode == "incremental":
                 task.incremental_key, task.incremental_note = _incremental_key(task=task)
+                if not source.tracks_row_changes and append.matches_table(schema=obj.db_schema, table=obj.name):
+                    used_append.add(obj.qualified_name)
+                    task.incremental_key, task.incremental_note = [], None     # append-only, no key
+                if task.incremental_key is not None and not source.tracks_row_changes:
+                    task.watermark_column, note = _watermark(task=task, column=config.refresh.watermark_column)
+                    if task.watermark_column is None:
+                        task.incremental_key, task.incremental_note = None, note
             plan.tables.append(task)
             renamed = {c.column.name.upper(): c.target_name for c in columns if c.renamed}
             if renamed:
                 plan.column_renames[(obj.db_schema.upper(), obj.name.upper())] = renamed
         plan.name_map[(obj.db_schema.upper(), obj.name.upper())] = (target_db_schema, target_name)
+        if excluded and role != "view":
+            plan.excluded_columns[(obj.db_schema.upper(), obj.name.upper())] = {c.upper() for c in excluded}
 
+    for _, pattern, _ in config_keys:
+        if pattern not in used_keys:
+            plan.warnings.append(f"refresh.keys pattern {pattern!r} matched no selected table")
+    if config.refresh.append and not used_append:
+        plan.warnings.append(f"refresh.append patterns {config.refresh.append} matched no selected table")
     problems = usage.unmatched()
     if problems:
         if config.fail_on_unmatched_column_rules:

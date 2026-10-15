@@ -1,5 +1,5 @@
-{{- if not .Values.config }}
-{{- fail "values.config is required: the replication config (see values.yaml)" }}
+{{- if not (or .Values.config .Values.configFile) }}
+{{- fail "values.config (or configFile) is required: the replication config (see values.yaml)" }}
 {{- end }}
 apiVersion: v1
 kind: ConfigMap
@@ -8,8 +8,12 @@ metadata:
   labels:
     {{- include "adbc-replicate.labels" . | nindent 4 }}
 data:
+  {{- if .Values.configFile }}
+  replicate.yaml: {{ .Values.configFile | quote }}
+  {{- else }}
   replicate.yaml: |
     {{- toYaml .Values.config | nindent 4 }}
+  {{- end }}
 {{- if .Values.viewOverrides }}
 ---
 apiVersion: v1

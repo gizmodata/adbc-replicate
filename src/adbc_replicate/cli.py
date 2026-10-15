@@ -167,7 +167,8 @@ def plan(config_path, env_file, fmt, show_sql, only) -> None:
                 "masked_columns": {c.column.name: c.mask.strategy for c in t.columns if c.mask},
                 "fingerprint": "yes" if source.fingerprint_sql(task=t) else "no (copied every run)",
                 "note": t.note,
-                **({"incremental_key": t.incremental_key, "incremental_note": t.incremental_note}
+                **({"incremental_key": t.incremental_key, "incremental_note": t.incremental_note,
+                    "watermark_column": t.watermark_column}
                    if config.refresh.mode == "incremental" else {}),
                 **({"sql": source.select_sql(task=t)} if show_sql else {}),
             })
@@ -194,7 +195,8 @@ def plan(config_path, env_file, fmt, show_sql, only) -> None:
                                          time_zone=config.views.source_time_zone,
                                          functions=config.views.functions,
                                          column_renames=the_plan.column_renames,
-                                         column_types=the_plan.column_types)
+                                         column_types=the_plan.column_types,
+                                         excluded_columns=the_plan.excluded_columns)
                     entry["status"] = "translates"
                 if show_sql:
                     entry["sql"] = sql
@@ -223,8 +225,11 @@ def plan(config_path, env_file, fmt, show_sql, only) -> None:
             extras.append("excluded: " + ", ".join(t["excluded_columns"]))
         if t["masked_columns"]:
             extras.append("masked: " + ", ".join(f"{k} ({v})" for k, v in t["masked_columns"].items()))
-        if t.get("incremental_key"):
-            extras.append("incremental on " + ", ".join(t["incremental_key"]))
+        if t.get("incremental_key") == [] and t.get("watermark_column"):
+            extras.append(f"incremental append, rows by {t['watermark_column']}")
+        elif t.get("incremental_key"):
+            extras.append("incremental on " + ", ".join(t["incremental_key"])
+                          + (f", rows by {t['watermark_column']}" if t.get("watermark_column") else ""))
         elif t.get("incremental_note"):
             extras.append(f"whole-table copies: {t['incremental_note']}")
         if t["fingerprint"] != "yes":

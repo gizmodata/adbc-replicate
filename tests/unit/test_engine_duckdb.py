@@ -534,3 +534,99 @@ def test_views_that_no_longer_bind_are_dropped_not_left_broken(paths):
                                           "AND schema_name = 'hr'").fetchall():
         con.execute(query=f'SELECT * FROM "{schema}"."{view}" LIMIT 0')
     con.close()
+
+
+def watermark_config(paths, **refresh):
+    source_exec(paths=paths, sql="""
+        CREATE TABLE hr.events (id INTEGER, payload VARCHAR, dbt_run_started_at TIMESTAMP);
+        INSERT INTO hr.events SELECT i, 'v1', TIMESTAMP '2026-10-15 10:00:00' FROM range(1, 101) t(i);""")
+    return make_config(paths=paths, objects=[{"db_schemas": ["hr"], "tables": ["events"], "views": []}], columns=[],
+                       refresh={"mode": "incremental", "keys": {"hr.events": ["ID"]},
+                                "watermark_column": "DBT_RUN_STARTED_AT", "detect_deletes": False, **refresh})
+
+
+def test_watermark_incremental_merges_rows_stamped_since_the_last_run(paths):
+    # Sources other than Oracle can't name changed rows themselves; a dbt-style run stamp can.
+    config = watermark_config(paths=paths)
+    summary, out = run(config=config)
+    assert summary.exit_code == EXIT_OK and summary.stats["tables_copied"] == 1, out
+    # the next dbt run updates one row and inserts one, stamping both
+    source_exec(paths=paths, sql="UPDATE hr.events SET payload = 'v2', dbt_run_started_at = TIMESTAMP '2026-10-15 11:00:00' "
+                                 "WHERE id = 7; INSERT INTO hr.events VALUES (101, 'v2', TIMESTAMP '2026-10-15 11:00:00')")
+    summary, out = run(config=config)
+    assert summary.exit_code == EXIT_OK and "rows with dbt_run_started_at after 2026-10-15 10:00:00" in out, out
+    assert summary.stats["tables_merged"] == 1, out
+    assert target_query(paths=paths, sql="SELECT count(*), count(*) FILTER (WHERE payload = 'v2') FROM hr.events") == \
+        [(101, 2)]
+    # a write that commits late with an older stamp is still inside the lookback window
+    source_exec(paths=paths, sql="UPDATE hr.events SET payload = 'late', dbt_run_started_at = "
+                                 "TIMESTAMP '2026-10-15 10:30:00' WHERE id = 8")
+    summary, out = run(config=config)
+    assert target_query(paths=paths, sql="SELECT payload FROM hr.events WHERE id = 8") == [("late",)], out
+
+
+def test_watermark_merge_falls_back_to_a_full_copy_on_deletes_and_duplicate_keys(paths):
+    config = watermark_config(paths=paths)
+    run(config=config)
+    # without delete detection, a deleted source row shows up as a row-count mismatch
+    source_exec(paths=paths, sql="DELETE FROM hr.events WHERE id = 3; "
+                                 "UPDATE hr.events SET dbt_run_started_at = TIMESTAMP '2026-10-15 11:00:00' WHERE id = 4")
+    summary, out = run(config=config)
+    assert summary.exit_code == EXIT_OK and "copying it whole" in out and summary.stats["tables_copied"] == 1, out
+    assert target_query(paths=paths, sql="SELECT count(*) FROM hr.events") == [(99,)]
+    # a key that isn't unique in the changed rows: DuckDB's MERGE would apply an arbitrary one of them
+    source_exec(paths=paths, sql="INSERT INTO hr.events VALUES (5, 'dup', TIMESTAMP '2026-10-15 12:00:00')")
+    summary, out = run(config=config)
+    assert summary.exit_code == EXIT_OK and "occur more than once" in out and summary.stats["tables_copied"] == 1, out
+    assert target_query(paths=paths, sql="SELECT count(*) FROM hr.events WHERE id = 5") == [(2,)]
+
+
+def test_watermark_needs_a_key_and_a_timestamp_column(paths):
+    config = watermark_config(paths=paths, keys={}, watermark_column="DBT_RUN_STARTED_AT")
+    run(config=config)
+    _, out = run(config=config)
+    assert "unchanged (fingerprint" in out, out     # no key: whole-table change detection
+    config = make_config(paths=paths, objects=[{"db_schemas": ["hr"], "tables": ["events"], "views": []}], columns=[],
+                         refresh={"mode": "incremental", "keys": {"hr.events": ["ID"]}, "watermark_column": "PAYLOAD"})
+    from adbc_replicate.planner import build_plan
+    from adbc_replicate.sources import make_source
+    source = make_source(config=config.source)
+    conn = source.connect()
+    try:
+        task = build_plan(config=config, source=source, conn=conn).tables[0]
+    finally:
+        conn.close()
+    assert task.incremental_key is None and "not a timestamp" in task.incremental_note
+    bad = make_config(paths=paths, objects=[{"db_schemas": ["hr"], "tables": ["events"], "views": []}], columns=[],
+                      refresh={"mode": "incremental", "keys": {"hr.events": ["NOPE"]}, "watermark_column": "X"})
+    with pytest.raises(PlanError, match=r"has no column\(s\) NOPE"):
+        run(config=bad)
+
+
+def test_append_mode_inserts_rows_stamped_since_the_last_run(paths):
+    # dbt incremental models without a unique_key are INSERTed into: append, no key, no lookback
+    config = watermark_config(paths=paths, keys={}, append=["hr.events"])
+    summary, out = run(config=config)
+    assert summary.stats["tables_copied"] == 1, out
+    source_exec(paths=paths, sql="INSERT INTO hr.events SELECT i, 'v2', TIMESTAMP '2026-10-15 11:00:00' "
+                                 "FROM range(101, 111) t(i)")
+    summary, out = run(config=config)
+    assert summary.exit_code == EXIT_OK and "Appending to hr.events" in out and summary.stats["tables_merged"] == 1, out
+    assert target_query(paths=paths, sql="SELECT count(*), count(DISTINCT id) FROM hr.events") == [(110, 110)]
+    # a dbt full refresh re-stamps every row: appending them would duplicate, so the count check re-copies
+    source_exec(paths=paths, sql="UPDATE hr.events SET dbt_run_started_at = TIMESTAMP '2026-10-15 12:00:00'")
+    summary, out = run(config=config)
+    assert "copying it whole" in out and summary.stats["tables_copied"] == 1, out
+    assert target_query(paths=paths, sql="SELECT count(*) FROM hr.events") == [(110,)]
+
+
+def test_watermark_starts_from_state_left_by_a_changed_mode_run(paths):
+    config = watermark_config(paths=paths)
+    changed = make_config(paths=paths, objects=[{"db_schemas": ["hr"], "tables": ["events"], "views": []}], columns=[])
+    run(config=changed)                              # state without a watermark
+    summary, out = run(config=config)                # unchanged: skipped, and the watermark is recorded
+    assert summary.stats["tables_copied"] == 0, out
+    source_exec(paths=paths, sql="UPDATE hr.events SET payload = 'v2', dbt_run_started_at = TIMESTAMP '2026-10-15 11:00:00' "
+                                 "WHERE id = 7")
+    summary, out = run(config=config)
+    assert summary.stats["tables_merged"] == 1 and summary.stats["tables_copied"] == 0, out

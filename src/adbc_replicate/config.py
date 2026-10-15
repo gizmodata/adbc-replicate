@@ -290,12 +290,41 @@ class RefreshConfig(_Model):
                     "the source). full: copy every table on every run. incremental: like changed, but a "
                     "table with a primary key (from the driver's catalog metadata) gets only the rows "
                     "changed since the last run, merged on the key, where the source can tell which rows "
-                    "changed (Oracle: ORA_ROWSCN, needs consistency: snapshot).",
+                    "changed (Oracle: ORA_ROWSCN, needs consistency: snapshot; other sources: "
+                    "refresh.watermark_column, with refresh.keys for tables that declare no key).",
     )
     detect_deletes: bool = Field(
         default=True,
         description="incremental: also delete target rows whose key no longer exists in the source "
-                    "(reads the source's key column(s) each run).",
+                    "(reads the source's key column(s) each run). When false, the target's row count is "
+                    "checked against the source's after each merge instead, and a mismatch (e.g. rows "
+                    "deleted in the source) re-copies that table whole.",
+    )
+    keys: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="incremental: merge keys for tables whose source declares no primary key (Snowflake "
+                    "keys are optional and informational; dbt models declare theirs as unique_key). "
+                    "DB_SCHEMA.TABLE pattern -> key columns; overrides a declared key. " + _PATTERN_HELP,
+    )
+    append: Patterns = Field(
+        default_factory=list,
+        description="incremental, with watermark_column: tables that only ever gain rows and have no key "
+                    "(e.g. dbt incremental models without a unique_key, which dbt INSERTs into). Rows stamped "
+                    "after the previous maximum are appended (no lookback, which would duplicate rows), then "
+                    "the row count is checked against the source; a mismatch re-copies the table whole. "
+                    "DB_SCHEMA.TABLE patterns. " + _PATTERN_HELP,
+    )
+    watermark_column: str | None = Field(
+        default=None,
+        description="incremental, for sources that can't tell which rows changed themselves (all but "
+                    "Oracle): a timestamp column every write stamps on the rows it inserts or updates, such "
+                    "as dbt's DBT_RUN_STARTED_AT. A keyed table that has it gets only the rows stamped after "
+                    "the previous run's maximum (minus watermark_lookback_minutes), merged on the key.",
+    )
+    watermark_lookback_minutes: int = Field(
+        default=360, ge=0,
+        description="Re-read rows stamped this long before the previous maximum, for writes that commit out "
+                    "of stamp order (two dbt jobs overlapping). Re-read rows merge to the same result.",
     )
 
 
@@ -309,9 +338,11 @@ class IngestConfig(_Model):
     )
     retries: int = Field(
         default=2, ge=0,
-        description="Re-load a table this many times after a transient connection error (gRPC "
-                    "'unavailable', e.g. 'the connection is draining' when a proxy in front of "
-                    "GizmoSQL reloads). Safe: a load is one transaction that replaces the table.",
+        description="Re-load a table this many times after a transient connection error: gRPC "
+                    "'unavailable' (e.g. 'the connection is draining' when a proxy in front of GizmoSQL "
+                    "reloads), or a network read failing while the source result streams in (e.g. a "
+                    "Snowflake result chunk download timing out). Safe: a load is one target "
+                    "transaction, rolled back before the retry.",
     )
     retry_wait_seconds: float = Field(default=5.0, ge=0, description="Wait before the first retry; doubles each time.")
 

@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Helm chart: `configFile` takes the replication config as a file (`--set-file
+  configFile=replicate.yaml`), comments included, as an alternative to `values.config`; `dotenv`
+  (or `dotenvSecret.name` / `.key` for an existing Secret) mounts a whole dotenv file at
+  `/secrets/.env` and loads it through `DOTENV_PATH`, so one `.env` serves the CLI and the cluster.
+
+- Incremental loads for sources without row-level change tracking (Snowflake, PostgreSQL, DuckDB):
+  `refresh.watermark_column` names a timestamp every write stamps (e.g. dbt's
+  `DBT_RUN_STARTED_AT`). Each run merges the rows stamped since the previous run's highest value,
+  minus `refresh.watermark_lookback_minutes` (default 360) for writers that commit out of order.
+- `refresh.keys`: merge keys per table where the source declares none (Snowflake keys are optional and
+  informational; dbt models keep their `unique_key` to themselves), overriding a declared key.
+- `refresh.append`: keyless tables that only gain rows (e.g. dbt incremental models without a
+  `unique_key`) get their newly stamped rows appended.
+- With `refresh.detect_deletes: false`, every merge or append is checked against the source's
+  row count, and a mismatch (deleted rows, a restamped append table, a non-unique key) rolls the
+  merge back and copies the table whole.
+- `plan` shows the watermark column for each incremental table.
+
+### Changed
+
+- Dependency floors: `adbc-driver-gizmosql>=2.0.15` and `adbc-driver-oracle>=1.0.1` (their Linux
+  wheels now load on glibc 2.17+, e.g. Oracle Linux 8, instead of needing glibc 2.32/2.34), and
+  `sqlglot>=30.23.0`.
+- A view's column list that only restates the names its `SELECT *` produces (Snowflake's
+  `GET_DDL` always writes one) is dropped, so the star expands to the columns the target really
+  has. Over tables with excluded columns, those views failed with "More VIEW aliases than columns
+  in query result". A list that renames columns is kept.
+- Helm chart: a config error (exit 2) or a run with view errors (exit 3) fails the Job without a
+  retry (`podFailurePolicy`), since a retry would fail the same way; `ttlSecondsAfterFinished` is
+  available to clean up finished Jobs.
+
+### Fixed
+
+- A merge key that occurs more than once among the changed rows made DuckDB's `MERGE` apply an
+  arbitrary one of them (it doesn't refuse, as the code had assumed); the table is now copied whole.
+- Network failures while a source result streams in (e.g. `[Snowflake] arrow/ipc: could not read
+  message body: ... read: operation timed out`, a result chunk download from cloud storage) are
+  retried like target connection drops, instead of failing the run.
+- `run_log.refresh_mode` recorded `changed` for incremental runs.
+- Snowflake views using `QUALIFY` on a window column computed in a CTE (`... FROM latest QUALIFY
+  rn = 1`) failed in DuckDB, which needs the window function in the same query ("at least one
+  window function must appear in the SELECT column or QUALIFY clause"). With no window function
+  and no aggregation in that query, the filter becomes `WHERE`, which returns the same rows.
+- A view whose `* EXCLUDE (...)` names a column that column rules also left out of the copied
+  table failed to bind ("Column ... in EXCLUDE list not found"). Such columns are dropped from the
+  list, since the target table no longer has them.
+
 ## [0.4.0] - 2026-10-15
 
 ### Added

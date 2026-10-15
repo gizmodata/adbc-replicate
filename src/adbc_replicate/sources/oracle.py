@@ -70,6 +70,8 @@ class OracleSource(Source):
                 errors.append(f"{how}: {e}")
         raise RuntimeError("couldn't read the current SCN: " + "; ".join(errors))
 
+    tracks_row_changes = True
+
     def change_token(self) -> str | None:
         return self.snapshot.token if self.snapshot is not None else None
 

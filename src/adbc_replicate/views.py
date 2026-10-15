@@ -1132,6 +1132,108 @@ def _user_functions(body: exp.Expression, functions: dict[str, str]) -> exp.Expr
     return body
 
 
+def _star_sources(star: exp.Expression) -> list[exp.Table] | None:
+    """The tables a SELECT * (or t.*) reads, or None when one of them isn't a plain table
+    (a CTE, subquery or table function), whose columns we can't know here."""
+    select = star.find_ancestor(exp.Select)
+    if select is None:
+        return None
+    sources = []
+    from_ = select.args.get(_FROM)
+    if from_ is not None:
+        sources.append(from_.this)
+    sources.extend(join.this for join in select.args.get("joins") or [])
+    qualifier = star.table if isinstance(star, exp.Column) else ""
+    if qualifier:
+        sources = [s for s in sources if s.alias_or_name.upper() == qualifier.upper()]
+    if not sources or not all(isinstance(s, exp.Table) and s.args.get("db") for s in sources):
+        return None
+    return sources
+
+
+def _drop_excluded_from_star_except(body: exp.Expression, excluded: dict[tuple[str, str], set[str]],
+                                    column_types: dict[tuple[str, str], dict[str, str]]) -> None:
+    """SELECT * EXCLUDE (c) over a table copied without column c fails to bind in the target
+    ("Column c in EXCLUDE list not found"). The target table already lacks c, so drop it from the
+    list (and drop an emptied list)."""
+    for node in list(body.find_all(exp.Star)):
+        names = node.args.get("except_")
+        if not names:
+            continue
+        star = node.parent if isinstance(node.parent, exp.Column) else node
+        sources = _star_sources(star=star)
+        if sources is None:
+            continue
+        keys = [(t.db.upper(), t.name.upper()) for t in sources]
+        if not any(k in excluded for k in keys):
+            continue
+
+        def gone(name: str, keys: list[tuple[str, str]] = keys) -> bool:
+            # left out of every source that had it, so the target reads no such column
+            had = [k for k in keys if name in column_types.get(k, {})]
+            return bool(had) and all(name in excluded.get(k, set()) for k in had)
+
+        kept = [c for c in names if not gone(name=c.name.upper())]
+        node.set("except_", kept or None)
+
+
+def _natural_column_list(body: exp.Expression, column_list: list[str],
+                         column_types: dict[tuple[str, str], dict[str, str]]) -> bool:
+    """True when a view's column list only restates the names its SELECT * produces anyway.
+
+    Snowflake's GET_DDL always writes the column list out, and Oracle's comes from the dictionary.
+    Over a star that list names every source column, including ones the copy left out (excluded
+    columns, here or in a view it reads), so the target sees more aliases than columns. When every
+    listed name is a star source's own column name or an explicit select item's name, the list
+    renames nothing and can go; a list that renames columns positionally is kept."""
+    selects = body.selects if isinstance(body, exp.Query) else []
+    stars = [e for e in selects if isinstance(e, exp.Star)
+             or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))]
+    if not stars:
+        return False
+    natural = {e.alias_or_name.upper() for e in selects if e not in stars and e.alias_or_name}
+    for star in stars:
+        sources = _star_sources(star=star)
+        if sources is None:
+            return True        # a CTE or subquery: its names are its own; keep what the star yields
+        for table in sources:
+            natural |= set(column_types.get((table.db.upper(), table.name.upper()), {}))
+    return all(name.upper() in natural for name in column_list)
+
+
+def _qualify_without_window(body: exp.Expression) -> None:
+    """Snowflake accepts QUALIFY with no window function (e.g. QUALIFY rn = 1 over a CTE's rn
+    column); DuckDB requires one in the SELECT list or the QUALIFY clause. With no window function
+    and no aggregation the predicate filters plain rows, which is exactly WHERE: QUALIFY runs after
+    GROUP BY/HAVING/windows, none of which exist here, and before DISTINCT, which a row filter
+    commutes with. SELECT-list aliases it uses are inlined, since WHERE can't see them reliably."""
+    for select in list(body.find_all(exp.Select)):
+        qualify = select.args.get("qualify")
+        if qualify is None or qualify.find(exp.Window):
+            continue
+        if any(e.find(exp.Window) for e in select.expressions):
+            continue
+        if select.args.get("group") or select.args.get("having") \
+                or any(e.find(exp.AggFunc) for e in select.expressions):
+            continue
+        predicate = qualify.this.copy()
+        aliases = {e.alias.upper(): e.this for e in select.expressions
+                   if isinstance(e, exp.Alias) and e.alias}
+        for column in list(predicate.find_all(exp.Column)):
+            if column.table or column.name.upper() not in aliases:
+                continue
+            source = aliases[column.name.upper()]
+            if isinstance(source, exp.Column) and source.name.upper() == column.name.upper():
+                continue
+            replacement = exp.Paren(this=source.copy())
+            if column is predicate:
+                predicate = replacement
+            else:
+                column.replace(replacement)
+        select.set("qualify", None)
+        select.where(predicate, copy=False)
+
+
 def translate_view(definition: str, source_dialect: str, view_db_schema: str, target_db_schema: str,
                    target_view: str, name_map: dict[tuple[str, str], tuple[str, str]], case: str,
                    source_columns: list[str] | None = None, target_catalog: str | None = None,
@@ -1139,6 +1241,7 @@ def translate_view(definition: str, source_dialect: str, view_db_schema: str, ta
                    column_types: dict[tuple[str, str], dict[str, str]] | None = None,
                    functions: dict[str, str] | None = None,
                    column_renames: dict[tuple[str, str], dict[str, str]] | None = None,
+                   excluded_columns: dict[tuple[str, str], set[str]] | None = None,
                    as_macro: bool = False) -> str | None:
     """Return a DuckDB-dialect CREATE OR REPLACE VIEW for a source view definition.
 
@@ -1202,6 +1305,12 @@ def translate_view(definition: str, source_dialect: str, view_db_schema: str, ta
     if functions:      # DuckDB SQL: after the source-dialect rewrites, which mustn't touch it
         body = _user_functions(body=body, functions=functions)
     body = qualify_tables(body, db=_quoted(name=view_db_schema), dialect=source_dialect)
+    if column_list and _natural_column_list(body=body, column_list=column_list, column_types=column_types or {}):
+        column_list = None
+    if excluded_columns:
+        _drop_excluded_from_star_except(body=body, excluded=excluded_columns, column_types=column_types or {})
+    if source_dialect == "snowflake":
+        _qualify_without_window(body=body)
 
     table_nodes = set()
     for table in body.find_all(exp.Table):

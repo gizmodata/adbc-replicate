@@ -54,8 +54,10 @@ class TableTask:
     columns: list[SelectedColumn]
     excluded_columns: list[str] = field(default_factory=list)
     note: str | None = None        # e.g. "view materialized as a table"
-    incremental_key: list[str] | None = None   # target column names to merge on; None: whole-table copies
+    incremental_key: list[str] | None = None   # target column names to merge on; [] appends (refresh.append);
+                                               # None: whole-table copies
     incremental_note: str | None = None        # why a table isn't incremental (refresh.mode: incremental)
+    watermark_column: str | None = None        # source column marking changed rows (refresh.watermark_column)
 
     @property
     def target_key(self) -> tuple[str, str]:
@@ -88,6 +90,9 @@ class Plan:
     # (source db_schema, name) upper-cased -> {source column upper-cased: target name}, for columns
     # renamed by column rules; views reading them are re-pointed.
     column_renames: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict)
+    # (source db_schema, name) upper-cased -> source column names upper-cased that column rules leave
+    # out; a view's * EXCLUDE (...) naming one of them would otherwise fail to bind in the target.
+    excluded_columns: dict[tuple[str, str], set[str]] = field(default_factory=dict)
 
 
 @dataclass

@@ -17,6 +17,18 @@ backoffLimit: 1
 activeDeadlineSeconds: null
 successfulJobsHistoryLimit: 3
 failedJobsHistoryLimit: 5
+# Delete finished Jobs (and their pods and logs) after this many seconds; null = keep them until
+# the history limits above remove them.
+ttlSecondsAfterFinished: null
+# Which pod failures are worth a retry (backoffLimit). A config error (exit 2) or a run that
+# finished with view errors (exit 3) fails the same way again, so those fail the Job at once.
+podFailurePolicy:
+  rules:
+    - action: FailJob
+      onExitCodes:
+        containerName: adbc-replicate
+        operator: In
+        values: [2, 3]
 
 # The replication config (the same document the CLI reads), rendered into a ConfigMap and
 # mounted at /config/replicate.yaml. Reference secrets as ${VAR}; never put them here.
@@ -37,6 +49,10 @@ config: {}
 #   objects:
 #     - db_schemas: [HR]
 
+# Or the config file itself, as text, used verbatim (comments kept); takes precedence over config:
+#   helm upgrade --install ... --set-file configFile=replicate.yaml
+configFile: ""
+
 # Hand-written view bodies ({"<DB_SCHEMA>.<VIEW>.sql": "SELECT ..."}), mounted at
 # /config/view-overrides. Set config.views.overrides_dir: /config/view-overrides to use them.
 viewOverrides: {}
@@ -51,6 +67,15 @@ existingSecret: ""
 secretEnv: {}
 # Plain (non-secret) environment variables.
 env: []
+
+# A whole dotenv file (KEY=value lines), mounted at /secrets/.env and loaded through DOTENV_PATH.
+# Variables already in the environment (existingSecret, secretEnv, env) take precedence over it.
+# Either name an existing Secret that holds the file...
+dotenvSecret:
+  name: ""
+  key: .env
+# ...or pass its content (helm upgrade --set-file dotenv=path/to/.env) and the chart creates the Secret.
+dotenv: ""
 
 resources:
   requests:

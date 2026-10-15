@@ -16,20 +16,38 @@ from ..config import DuckDBTarget as DuckDBConfig
 from ..config import GizmoSQLTarget as GizmoSQLConfig
 from ..sources.base import quote_ident
 
+# Network failures while a result streams in from the source (the source driver's message is
+# wrapped in the target's ingest error). Snowflake hands results over as chunk downloads from
+# cloud storage, and one read timing out fails the whole load: "[Snowflake] arrow/ipc: could not
+# read message body: read tcp ...: read: operation timed out".
+_NETWORK_ERRORS = ("read: operation timed out", "i/o timeout", "connection reset by peer", "broken pipe",
+                   "could not read message body", "unexpected EOF")
+
 
 def is_transient(error: BaseException | str) -> bool:
     """A connection-level failure worth retrying: gRPC 'unavailable' (a proxy reload sends
-    GOAWAY, the server restarts, the network blips), as opposed to an error in the request."""
+    GOAWAY, the server restarts, the network blips) or a network read failing mid-stream, as
+    opposed to an error in the request."""
+    text = str(error)
+    return ("(Unavailable;" in text or "connection is draining" in text or "GOAWAY" in text
+            or any(marker in text for marker in _NETWORK_ERRORS))
+
+
+def _target_unavailable(error: BaseException) -> bool:
     text = str(error)
     return "(Unavailable;" in text or "connection is draining" in text or "GOAWAY" in text
 
 
 def _failed_before_running(error: BaseException) -> bool:
     """True when a statement failed while being prepared, so it never ran and can be resent."""
-    return is_transient(error=error) and "Prepare)" in str(error)
+    return _target_unavailable(error=error) and "Prepare)" in str(error)
 
 
 STATEMENT_RETRIES = 3
+
+
+class DuplicateKeyError(Exception):
+    """An incremental merge key isn't unique in the rows being merged."""
 
 
 class DuckDBFamilyTarget:
@@ -128,9 +146,17 @@ class DuckDBFamilyTarget:
         """MERGE the staged changed rows into the table on `key` (update matches, insert the rest, both
         by column name), and when `keys` (a staged list of every source key) is given, MERGE away the
         target rows whose key is gone. Runs in the caller's transaction; drops the staging tables.
-        MERGE also refuses a key that matches more than once. Returns (rows merged, rows deleted)."""
+        DuckDB's MERGE accepts several source rows with one key and applies an arbitrary one, so
+        staged changes with a repeated key raise DuplicateKeyError instead (the key isn't unique;
+        the caller copies the table whole). Returns (rows merged, rows deleted)."""
         target = self.qualified(db_schema=db_schema, name=table)
         staged = self.qualified(db_schema=staging_db_schema, name=changes)
+        columns = ", ".join(quote_ident(name=k) for k in key)
+        repeated = self.query(conn=conn, sql=f"SELECT count(*) FROM (SELECT {columns} FROM {staged} "
+                                             f"GROUP BY ALL HAVING count(*) > 1)")[0][0]
+        if repeated:
+            raise DuplicateKeyError(f"{repeated} key value(s) of ({', '.join(key)}) occur more than once among "
+                                    "the changed rows, so the key isn't unique")
         match = " AND ".join(f"t.{quote_ident(name=k)} = s.{quote_ident(name=k)}" for k in key)
         merged = self.update(conn=conn, sql=f"MERGE INTO {target} AS t USING {staged} AS s ON ({match}) "
                                             "WHEN MATCHED THEN UPDATE BY NAME WHEN NOT MATCHED THEN INSERT BY NAME")
@@ -142,6 +168,14 @@ class DuckDBFamilyTarget:
             self.execute(conn=conn, sql=f"DROP TABLE {current}")
         self.execute(conn=conn, sql=f"DROP TABLE {staged}")
         return merged, deleted
+
+    def append(self, conn, db_schema: str, table: str, staging_db_schema: str, changes: str) -> int:
+        """INSERT the staged rows into the table by column name (refresh.append); drops the staging table."""
+        target = self.qualified(db_schema=db_schema, name=table)
+        staged = self.qualified(db_schema=staging_db_schema, name=changes)
+        inserted = self.update(conn=conn, sql=f"INSERT INTO {target} BY NAME SELECT * FROM {staged}")
+        self.execute(conn=conn, sql=f"DROP TABLE {staged}")
+        return inserted
 
     @staticmethod
     def update(conn, sql: str) -> int:

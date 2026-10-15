@@ -136,3 +136,13 @@ class SnowflakeSource(Source):
             return None
         return (f"SELECT TO_VARCHAR(COUNT(*)), TO_VARCHAR(HASH_AGG({', '.join(cols)})) "
                 f"FROM {self.table_ref(obj=task.source)}")
+
+    def watermark_sql(self, task: TableTask) -> str:
+        col = self.quote(name=task.watermark_column)
+        return (f"SELECT TO_VARCHAR(MAX({col})::TIMESTAMP_NTZ, 'YYYY-MM-DD HH24:MI:SS.FF9') "
+                f"FROM {self.table_ref(obj=task.source)}")
+
+    def watermark_filter(self, task: TableTask, previous: str, lookback_minutes: int) -> str:
+        col = self.quote(name=task.watermark_column)
+        return (f"{col}::TIMESTAMP_NTZ > DATEADD(minute, -{int(lookback_minutes)}, "
+                f"{quote_literal(value=previous)}::TIMESTAMP_NTZ)")

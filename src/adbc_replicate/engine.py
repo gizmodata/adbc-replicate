@@ -25,7 +25,7 @@ from .planner import PlanError, build_plan
 from .sources import make_source
 from .state import StateStore, column_signature
 from .targets import make_target
-from .targets.duckdb import is_transient
+from .targets.duckdb import DuplicateKeyError, is_transient
 from .views import ViewTranslationError, create_view_sql, load_override, translate_view
 
 EXIT_OK = 0
@@ -171,9 +171,9 @@ class Replicator:
         marker = self.source.change_marker(obj=task.source)
         row_count = fingerprint = None
         # refresh.mode incremental, for a table with a usable primary key: merge the changed rows
-        incremental = (self.config.refresh.mode == "incremental" and bool(task.incremental_key)
+        incremental = (self.config.refresh.mode == "incremental" and task.incremental_key is not None
                        and self.options.row_limit is None and not self.options.full_refresh)
-        token = self.source.change_token() if incremental else None
+        token = self.source.change_token() if incremental and not task.watermark_column else None
         try:
             signature = self.signature(task=task)
             if self.options.row_limit is not None:
@@ -189,18 +189,44 @@ class Replicator:
             elif marker is not None and previous["change_marker"] == marker:
                 return TableResult(task=task, action="skipped", reason="unchanged (change marker)",
                                    row_count=previous["row_count"], fingerprint=previous["fingerprint"],
-                                   seconds=time.monotonic() - started, change_token=token)
+                                   seconds=time.monotonic() - started,
+                                   change_token=self._skip_token(conn=sconn, task=task, previous=previous,
+                                                                 token=token, incremental=incremental))
+            elif incremental and task.watermark_column and previous.get("change_token") and \
+                    (token := self._watermark(conn=sconn, task=task)) is not None:
+                since = previous["change_token"]
+                appending = not task.incremental_key
+                where = self.source.watermark_filter(
+                    task=task, previous=since,
+                    lookback_minutes=0 if appending else self.config.refresh.watermark_lookback_minutes)
+                how = "appending" if appending else f"key {', '.join(task.incremental_key)}"
+                self.emit("table_started", f"  🔄 {'Appending to' if appending else 'Merging'} {name} → "
+                          f"{task.target_db_schema}.{task.target_table} "
+                          f"(rows with {task.watermark_column} after {since}, {how})",
+                          table=name, target=f"{task.target_db_schema}.{task.target_table}", reason="incremental",
+                          since=since)
+                result = self._with_retries(task=task, tconn=tconn, load=lambda: self._merge(
+                    task=task, sconn=sconn, tconn=tconn, where=where))
+                if result is not None:
+                    merged, deleted, row_count = result
+                    return TableResult(task=task, action="merged", reason=f"incremental since {since}", rows=merged,
+                                       deleted=deleted, row_count=row_count, change_token=token,
+                                       seconds=time.monotonic() - started)
+                reason = "row count differs from the source after the merge"
             elif token and previous.get("change_token") and \
                     (where := self.source.incremental_filter(previous_token=previous["change_token"])) is not None:
                 since = previous["change_token"]
                 self.emit("table_started", f"  🔄 Merging {name} → {task.target_db_schema}.{task.target_table} "
                           f"(rows changed since {since}, key {', '.join(task.incremental_key)})", table=name,
                           target=f"{task.target_db_schema}.{task.target_table}", reason="incremental", since=since)
-                merged, deleted, row_count = self._with_retries(task=task, tconn=tconn, load=lambda: self._merge(
+                result = self._with_retries(task=task, tconn=tconn, load=lambda: self._merge(
                     task=task, sconn=sconn, tconn=tconn, where=where))
-                return TableResult(task=task, action="merged", reason=f"incremental since {since}", rows=merged,
-                                   deleted=deleted, row_count=row_count, change_token=token,
-                                   seconds=time.monotonic() - started)
+                if result is not None:
+                    merged, deleted, row_count = result
+                    return TableResult(task=task, action="merged", reason=f"incremental since {since}", rows=merged,
+                                       deleted=deleted, row_count=row_count, change_token=token,
+                                       seconds=time.monotonic() - started)
+                reason = "row count differs from the source after the merge"
             else:
                 row_count, fingerprint = self._fingerprint(conn=sconn, task=task)
                 if fingerprint is not None and previous["fingerprint"] == fingerprint \
@@ -209,7 +235,9 @@ class Replicator:
                     return TableResult(task=task, action="skipped",
                                        reason=f"unchanged (fingerprint, {fmt_rows(row_count)} rows)",
                                        row_count=row_count, fingerprint=fingerprint,
-                                       seconds=time.monotonic() - started, change_token=token)
+                                       seconds=time.monotonic() - started,
+                                       change_token=self._skip_token(conn=sconn, task=task, previous=previous,
+                                                                     token=token, incremental=incremental))
                 reason = "content changed" if fingerprint is not None else "no fingerprint for this table"
 
             # Fingerprint BEFORE the copy: if the table changes in between, the next run sees a
@@ -219,6 +247,9 @@ class Replicator:
                     and self.config.refresh.mode in ("changed", "incremental"):
                 row_count, fingerprint = self._fingerprint(conn=sconn, task=task)
 
+            if incremental and task.watermark_column and token is None:
+                # taken BEFORE the copy: rows stamped while it runs are read again next time
+                token = self._watermark(conn=sconn, task=task)
             self.emit("table_started", f"  📦 Copying {name} → {task.target_db_schema}.{task.target_table} ({reason})",
                       table=name, target=f"{task.target_db_schema}.{task.target_table}", reason=reason)
             rows = self._with_retries(task=task, tconn=tconn, load=lambda: self._copy(
@@ -262,24 +293,61 @@ class Replicator:
         tconn.commit()
         return copied
 
-    def _merge(self, task: TableTask, sconn, tconn, where: str) -> tuple[int, int, int]:
+    def _skip_token(self, conn, task: TableTask, previous: dict, token: str | None, incremental: bool) -> str | None:
+        """The change token to keep for an unchanged table: the run's token (Oracle SCN), or for a
+        watermark table its previous watermark, read now if it has none yet (e.g. state from a run in
+        refresh mode changed), so the next change can be merged instead of copied."""
+        if not (incremental and task.watermark_column):
+            return token
+        return previous.get("change_token") or self._watermark(conn=conn, task=task)
+
+    def _watermark(self, conn, task: TableTask) -> str | None:
+        rows = self.source.fetch_all(conn=conn, sql=self.source.watermark_sql(task=task))
+        return str(rows[0][0]) if rows and rows[0][0] is not None else None
+
+    def _merge(self, task: TableTask, sconn, tconn, where: str) -> tuple[int, int, int] | None:
         """Stage the rows changed since the last run (and, for delete detection, every current key)
-        in the state db_schema, then merge them into the table in the same target transaction."""
+        in the state db_schema, then merge them into the table in the same target transaction.
+        Without delete detection, the merged table's row count must equal the source's; if it doesn't
+        (rows were deleted, or a key isn't unique), the merge is rolled back and None returned, so
+        the caller copies the table whole."""
         staging = self.config.state.db_schema
         suffix = hashlib.sha256("|".join(task.target_key).encode()).hexdigest()[:8]
         changes, keys = f"_changes_{suffix}", f"_keys_{suffix}"
         self._load(task=task, sql=self.source.select_sql(task=task, where=where), sconn=sconn, tconn=tconn,
                    db_schema=staging, table=changes)
-        if self.config.refresh.detect_deletes:
+        detect_deletes = self.config.refresh.detect_deletes and bool(task.incremental_key)
+        if detect_deletes:
             key_task = dataclasses.replace(task, columns=[c for c in task.columns
                                                           if c.target_name in task.incremental_key])
             self._load(task=key_task, sql=self.source.select_sql(task=key_task), sconn=sconn, tconn=tconn,
                        db_schema=staging, table=keys, quiet=True)
-        merged, deleted = self.target.merge(conn=tconn, db_schema=task.target_db_schema, table=task.target_table,
-                                            key=task.incremental_key, staging_db_schema=staging, changes=changes,
-                                            keys=keys if self.config.refresh.detect_deletes else None)
+        try:
+            if not task.incremental_key:
+                merged, deleted = self.target.append(conn=tconn, db_schema=task.target_db_schema,
+                                                     table=task.target_table, staging_db_schema=staging,
+                                                     changes=changes), 0
+            else:
+                merged, deleted = self.target.merge(conn=tconn, db_schema=task.target_db_schema,
+                                                    table=task.target_table, key=task.incremental_key,
+                                                    staging_db_schema=staging, changes=changes,
+                                                    keys=keys if detect_deletes else None)
+        except DuplicateKeyError as e:
+            tconn.rollback()
+            self.emit("table_merge_mismatch", f"  ⚠️  {task.source.qualified_name}: {e}; copying it whole",
+                      level="warning", table=task.source.qualified_name, error=str(e))
+            return None
         row_count = self.target.query(conn=tconn, sql="SELECT count(*) FROM " + self.target.qualified(
             db_schema=task.target_db_schema, name=task.target_table))[0][0]
+        if not detect_deletes:
+            source_count = int(float(self.source.fetch_all(conn=sconn, sql=self.source.count_sql(task=task))[0][0]))
+            if source_count != int(row_count):
+                tconn.rollback()
+                self.emit("table_merge_mismatch", f"  ⚠️  {task.source.qualified_name}: {fmt_rows(int(row_count))} rows "
+                          f"after the merge, {fmt_rows(source_count)} in the source; copying it whole",
+                          level="warning", table=task.source.qualified_name, target_rows=int(row_count),
+                          source_rows=source_count)
+                return None
         tconn.commit()
         return merged, deleted, int(row_count)
 
@@ -415,7 +483,8 @@ class Replicator:
                     source_columns=[c.name for c in view.source.columns], target_catalog=self.target.catalog,
                     pseudo_columns=self.config.views.source_pseudo_columns,
                     time_zone=self.config.views.source_time_zone, column_types=plan.column_types,
-                    functions=self.config.views.functions, column_renames=plan.column_renames)
+                    functions=self.config.views.functions, column_renames=plan.column_renames,
+                    excluded_columns=plan.excluded_columns)
                 statements[view.target_key] = translate()
             except Exception as e:
                 failures[name] = f"translation: {e}"
@@ -573,7 +642,7 @@ class Replicator:
 
     def _recorded_run(self, run_id: str, stats: dict) -> RunSummary:
         snapshot_desc = None
-        refresh_mode = "full" if (self.options.full_refresh or self.config.refresh.mode == "full") else "changed"
+        refresh_mode = "full" if self.options.full_refresh else self.config.refresh.mode
         target_conn = self.target.connect()
         try:
             store = StateStore(target=self.target, conn=target_conn, db_schema=self.config.state.db_schema)

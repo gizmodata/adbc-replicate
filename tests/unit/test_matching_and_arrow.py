@@ -69,3 +69,16 @@ def test_strict_decimal_cast_fails_loudly():
                     casts={0: pa.decimal128(precision=38, scale=10)})
     with pytest.raises(pa.ArrowInvalid, match="data loss"):
         out.read_all()
+
+
+def test_transient_errors_include_source_network_reads():
+    from adbc_replicate.targets.duckdb import _failed_before_running, is_transient
+    snowflake_chunk = ("OperationalError: UNKNOWN: [GizmoSQL] [FlightSQL] input/output error: IOError: [Snowflake] "
+                       "arrow/ipc: could not read message body: read tcp 10.0.0.1:59972->16.15.191.166:443: "
+                       "read: operation timed out")
+    assert is_transient(error=snowflake_chunk)
+    assert is_transient(error="UNAVAILABLE: [FlightSQL] the connection is draining (Unavailable; DoPut)")
+    assert not is_transient(error="INVALID_ARGUMENT: Binder Error: column x not found (InvalidArgument; Prepare)")
+    assert not is_transient(error="ORA-01722: invalid number")
+    # only a target that was unavailable during Prepare is known not to have run the statement
+    assert not _failed_before_running(error=Exception(snowflake_chunk + " (Prepare)"))
