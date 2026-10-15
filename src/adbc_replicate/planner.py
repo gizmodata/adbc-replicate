@@ -202,6 +202,9 @@ def build_plan(config: ReplicationConfig, source, conn) -> Plan:
             if config.refresh.mode == "incremental":
                 task.incremental_key, task.incremental_note = _incremental_key(task=task)
             plan.tables.append(task)
+            renamed = {c.column.name.upper(): c.target_name for c in columns if c.renamed}
+            if renamed:
+                plan.column_renames[(obj.db_schema.upper(), obj.name.upper())] = renamed
         plan.name_map[(obj.db_schema.upper(), obj.name.upper())] = (target_db_schema, target_name)
 
     problems = usage.unmatched()

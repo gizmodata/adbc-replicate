@@ -71,8 +71,8 @@ def _fill(template: str, value: exp.Expression, second: exp.Expression | None = 
         node = nodes.get(column.name)
         if node is None:
             continue
-        column.replace(node.copy() if column.name in used else node)
-        used.add(column.name)
+        column.replace(node.copy() if id(node) in used else node)    # one node may stand for two names
+        used.add(id(node))
     return tree
 
 
@@ -81,6 +81,11 @@ def _to_char(value: exp.Expression, fmt: str) -> exp.Expression | None:
         return _fill(template="RPAD(UPPER(STRFTIME(__x__, '%A')), 9, ' ')", value=value)
     if fmt == "fmDAY":
         return _fill(template="UPPER(STRFTIME(__x__, '%A'))", value=value)
+    if re.fullmatch(r"0+", fmt):                            # 000: zero-padded after a sign position
+        k = len(fmt)
+        padded = f"LPAD(CAST(CAST(ABS(ROUND(__x__)) AS BIGINT) AS VARCHAR), {k}, '0')"
+        return _fill(template=f"CASE WHEN ABS(ROUND(__x__)) >= {10 ** k} THEN REPEAT('#', {k + 1}) "
+                              f"WHEN __x__ < 0 THEN '-' || {padded} ELSE ' ' || {padded} END", value=value)
     body = fmt[2:] if fmt[:2].lower() == "fm" else None
     if body and re.fullmatch(r"0+", body):                  # fm0000000: zero-padded integer
         k = len(body)
@@ -129,9 +134,10 @@ class _OracleTypes:
     """Infers the Oracle type class of an expression: DATE, TIMESTAMP, NUMBER, STRING, INTERVAL or None.
     Columns come from the source catalog, through table aliases, subqueries and CTEs."""
 
-    def __init__(self, column_types: dict, default_schema: str) -> None:
+    def __init__(self, column_types: dict, default_schema: str, function_types: dict | None = None) -> None:
         self.column_types = column_types
         self.default_schema = default_schema
+        self.function_types = function_types or {}      # views.functions NAME -> type class (RETURN ...)
         self.memo: dict[int, str | None] = {}
 
     def of(self, node: exp.Expression | None) -> str | None:
@@ -182,6 +188,8 @@ class _OracleTypes:
             return "NUMBER" if to in exp.DataType.NUMERIC_TYPES else None
         if isinstance(node, exp.Anonymous):
             name = node.name.upper()
+            if name in self.function_types:
+                return self.function_types[name]
             if name == "TRUNC" and node.expressions:
                 kind = self.of(node.expressions[0])
                 return "DATE" if kind in ("DATE", "TIMESTAMP") else kind
@@ -222,11 +230,11 @@ class _OracleTypes:
             return None
         source = sources[0]
         if isinstance(source, exp.Subquery):
-            return self._projection(query=source.this, name=column.name)
+            return self._projection(query=source.this, name=column.name, alias=source.args.get("alias"))
         if isinstance(source, exp.Table):
             cte = self._cte(node=select, name=source.name) if not source.db else None
             if cte is not None:
-                return self._projection(query=cte.this, name=column.name)
+                return self._projection(query=cte.this, name=column.name, alias=cte.args.get("alias"))
             columns = self.column_types.get(((source.db or self.default_schema).upper(), source.name.upper()), {})
             return self._class(data_type=columns.get(column.name.upper()))
         return None
@@ -241,11 +249,17 @@ class _OracleTypes:
             node = node.parent
         return None
 
-    def _projection(self, query: exp.Expression, name: str) -> str | None:
+    def _projection(self, query: exp.Expression, name: str, alias: exp.TableAlias | None = None) -> str | None:
         while isinstance(query, exp.SetOperation):
             query = query.this       # UNION branches share the first branch's column types
         if not isinstance(query, exp.Select):
             return None
+        columns = [c.name.upper() for c in alias.args.get("columns") or []] if alias is not None else []
+        if columns:                  # WITH c (a, b) AS (...) / (...) AS x(a, b): by position
+            if name.upper() not in columns or columns.index(name.upper()) >= len(query.expressions):
+                return None
+            projection = query.expressions[columns.index(name.upper())]
+            return self.of(projection.this if isinstance(projection, exp.Alias) else projection)
         for projection in query.expressions:
             if projection.alias_or_name.upper() == name.upper():
                 return self.of(projection.this if isinstance(projection, exp.Alias) else projection)
@@ -260,8 +274,8 @@ def _date_plus(date: exp.Expression, days: exp.Expression, sign: str) -> exp.Exp
 
 
 def _oracle_dates(body: exp.Expression, time_zone: str | None, column_types: dict,
-                  default_schema: str) -> exp.Expression:
-    types = _OracleTypes(column_types=column_types, default_schema=default_schema)
+                  default_schema: str, function_types: dict | None = None) -> exp.Expression:
+    types = _OracleTypes(column_types=column_types, default_schema=default_schema, function_types=function_types)
     # Decide everything on the untouched Oracle tree, then rewrite.
     arithmetic = []
     for node in body.find_all(exp.Add, exp.Sub):
@@ -435,7 +449,7 @@ def _rebind(node: exp.Expression, level: exp.Expression, prior: str | None, chil
             done.add(id(column))
         p.replace(inner)
     for column in list(node.find_all(exp.Column)):
-        if id(column) in done or column.find_ancestor(exp.Select):
+        if id(column) in done or column.find_ancestor(exp.Select) or column.meta.get("param"):
             continue
         if _bare(column=column, name="LEVEL"):
             column.replace(level.copy())
@@ -445,12 +459,8 @@ def _rebind(node: exp.Expression, level: exp.Expression, prior: str | None, chil
 
 
 def _path_text(value: exp.Expression) -> exp.Expression:
-    """How SYS_CONNECT_BY_PATH turns a value into text: numbers the way Oracle prints them (no
-    trailing zeros, no leading 0 before the point: 1.50 -> '1.5', 0.5 -> '.5'), NULL as ''."""
-    number = ("regexp_replace(regexp_replace(regexp_replace(CAST(__x__ AS VARCHAR), '(\\.\\d*?)0+$', '\\1'), "
-              "'\\.$', ''), '^(-?)0\\.', '\\1.')")
-    return _fill(template=f"coalesce(CASE WHEN typeof(__x__) LIKE 'DECIMAL%' OR typeof(__x__) IN ('DOUBLE', 'FLOAT') "
-                          f"THEN {number} ELSE CAST(__x__ AS VARCHAR) END, '')", value=value)
+    """How SYS_CONNECT_BY_PATH turns a value into text: as Oracle converts it implicitly, NULL as ''."""
+    return exp.Coalesce(this=_oracle_text(value=value, kind=None), expressions=[exp.Literal.string("")])
 
 
 def _connect_by(select: exp.Select, name: str) -> None:
@@ -555,6 +565,7 @@ def _connect_by(select: exp.Select, name: str) -> None:
             text = _path_text(value=_rebind(node=value, level=next_level, prior=prior_t, child=child_t))
             step.append(exp.DPipe(this=parent_path, expression=text).as_(column, quoted=True))
         node.replace(exp.Column(this=_quoted(name=column), table=me.copy()))
+    leaf_join = False
     for column in list(select.find_all(exp.Column)):
         if column.find_ancestor(exp.Connect) is not None or column.find_ancestor(exp.Select) is not select:
             continue
@@ -564,12 +575,13 @@ def _connect_by(select: exp.Select, name: str) -> None:
             column.replace(exp.Window(this=exp.RowNumber(), order=exp.Order(
                 expressions=[exp.Ordered(this=exp.Column(this=_quoted(name=_CB_ORDER), table=me.copy()))])))
         elif _bare(column=column, name="CONNECT_BY_ISLEAF"):
-            child_rows = exp.select("1").from_(exp.Table(this=_quoted(name=name), alias=exp.TableAlias(
-                this=_quoted(name=f"{name}_child")))).where(exp.EQ(
-                    this=exp.column(_CB_PARENT, table=f"{name}_child", quoted=True),
-                    expression=exp.Column(this=_quoted(name=_CB_ORDER), table=me.copy())))
-            column.replace(exp.Case(ifs=[exp.If(this=exp.Exists(this=child_rows), true=exp.Literal.number(0))],
-                                    default=exp.Literal.number(1)))
+            # a leaf is a row no other row names as its parent: a LEFT JOIN to the distinct parents
+            # (EXISTS over the recursive CTE trips a DuckDB binder error when the query is itself a
+            # correlated subquery, e.g. inside a views.functions template)
+            leaf_join = True
+            column.replace(exp.Case(ifs=[exp.If(this=exp.Is(this=exp.column(_CB_PARENT, table=f"{name}_parents",
+                                                                            quoted=True), expression=exp.null()),
+                                                true=exp.Literal.number(1))], default=exp.Literal.number(0)))
 
     anchor_select = exp.Select(expressions=anchor).from_(source.copy())
     if start is not None:
@@ -592,12 +604,290 @@ def _connect_by(select: exp.Select, name: str) -> None:
                   alias=exp.TableAlias(this=_quoted(name=name)))
     select.set("connect", None)
     select.set(_FROM, exp.From(this=exp.Table(this=_quoted(name=name), alias=exp.TableAlias(this=me.copy()))))
+    if leaf_join:
+        parents = exp.select(exp.column(_CB_PARENT, quoted=True)).distinct().from_(exp.Table(this=_quoted(name=name)))
+        select.join(exp.Subquery(this=parents, alias=exp.TableAlias(this=_quoted(name=f"{name}_parents"))),
+                    on=exp.EQ(this=exp.column(_CB_PARENT, table=f"{name}_parents", quoted=True),
+                              expression=exp.Column(this=_quoted(name=_CB_ORDER), table=me.copy())),
+                    join_type="LEFT", copy=False)
     with_ = select.args.get(_WITH)
     if with_ is None:
         select.set(_WITH, exp.With(expressions=[cte], recursive=True))
     else:
         with_.append("expressions", cte)
         with_.set("recursive", True)
+
+
+# How Oracle turns a value into text where none is asked for (TO_CHAR(x), ||, CONCAT): numbers
+# without trailing zeros or a leading 0 before the point (1.50 -> '1.5', 0.5 -> '.5'), a DATE in
+# NLS_DATE_FORMAT and a TIMESTAMP in NLS_TIMESTAMP_FORMAT, at their defaults (DD-MON-RR,
+# DD-MON-RR HH.MI.SSXFF AM, English month names).
+_NUMBER_TEXT = ("regexp_replace(regexp_replace(regexp_replace(CAST(__x__ AS VARCHAR), '(\\.\\d*?)0+$', '\\1'), "
+                "'\\.$', ''), '^(-?)0\\.', '\\1.')")
+_DATE_TEXT = "upper(strftime(__x__, '%d-%b-%y'))"
+_TIMESTAMP_TEXT = "upper(strftime(__x__, '%d-%b-%y %I.%M.%S.%f %p'))"
+
+
+def _number_literal_text(literal: exp.Literal) -> str:
+    import decimal
+    text = format(decimal.Decimal(literal.this).normalize(), "f")
+    return re.sub(r"^(-?)0\.", r"\1.", text)
+
+
+def _oracle_text(value: exp.Expression, kind: str | None) -> exp.Expression:
+    """`value` as text the way Oracle converts it implicitly; `kind` is its inferred type class
+    (unknown: decided at run time from the DuckDB type, numbers only)."""
+    if isinstance(value, exp.Literal):
+        return value if value.is_string else exp.Literal.string(_number_literal_text(literal=value))
+    if kind == "STRING":
+        return value
+    template = {"NUMBER": _NUMBER_TEXT, "DATE": _DATE_TEXT, "TIMESTAMP": _TIMESTAMP_TEXT}.get(kind or "")
+    if template is None:
+        template = (f"CASE WHEN typeof(__x__) LIKE 'DECIMAL%' OR typeof(__x__) IN ('DOUBLE', 'FLOAT') "
+                    f"THEN {_NUMBER_TEXT} ELSE CAST(__x__ AS VARCHAR) END")
+    return _fill(template=template, value=value)
+
+
+def _concat_operands(node: exp.Expression) -> list[exp.Expression]:
+    if isinstance(node, exp.DPipe):
+        return _concat_operands(node=node.this) + _concat_operands(node=node.expression)
+    return [node]
+
+
+def _oracle_concat(body: exp.Expression, types: _OracleTypes) -> None:
+    """Oracle a || b and CONCAT(a, b) treat NULL as '' and give NULL only when the result is empty
+    ('' is NULL in Oracle); DuckDB's || gives NULL if either side is NULL. -> NULLIF(CONCAT(...), '')
+    with each operand converted to text as Oracle does. Checked against Oracle."""
+    tops = [n for n in body.find_all(exp.DPipe, exp.Concat)
+            if not (isinstance(n, exp.DPipe) and isinstance(n.parent, exp.DPipe))]
+    work = []
+    for node in tops:
+        operands = node.expressions if isinstance(node, exp.Concat) else _concat_operands(node=node)
+        work.append((node, [(op, types.of(op)) for op in operands]))     # types before anything moves
+    for node, operands in sorted(work, key=lambda w: -w[0].depth):
+        parts = [_oracle_text(value=op, kind=kind) for op, kind in operands if not isinstance(op, exp.Null)]
+        concat = exp.Anonymous(this="CONCAT", expressions=parts) if parts else exp.Literal.string("")
+        node.replace(exp.Nullif(this=concat, expression=exp.Literal.string("")))
+
+
+def _substr(node: exp.Substring, kind: str | None) -> exp.Expression:
+    """Oracle SUBSTR(s, position [, length]): position 0 counts as 1, fractions are truncated, a length
+    below 1 or a negative position before the start gives NULL, an empty result is NULL, and a number
+    is converted to text first. Checked against Oracle."""
+    text = node.this if kind in ("STRING", None) else _oracle_text(value=node.this, kind=kind)
+    start, length = node.args.get("start"), node.args.get("length")
+    pos = _int_literal(node=start, default=1)
+    if pos is not None:
+        start = exp.Literal.number(1 if pos == 0 else pos)
+    else:
+        start = _fill(template="CASE WHEN TRUNC(__x__) = 0 THEN 1 ELSE CAST(TRUNC(__x__) AS BIGINT) END", value=start)
+    guard = None
+    if length is not None:
+        n = _int_literal(node=length, default=1)
+        if n is not None and n < 1:
+            return exp.Cast(this=exp.null(), to=exp.DataType.build("VARCHAR"))
+        if n is None:
+            guard = length.copy()
+            length = _fill(template="CAST(TRUNC(__x__) AS BIGINT)", value=length)
+    raw_start = node.args.get("start")
+    result = exp.Nullif(this=exp.Substring(this=text, start=start, length=length), expression=exp.Literal.string(""))
+    if guard is not None:
+        result = _fill(template="CASE WHEN TRUNC(__x__) < 1 THEN NULL ELSE __y__ END", value=guard, second=result)
+    # a negative position before the start of the string is NULL in Oracle (DuckDB clamps it)
+    if pos is not None and pos < 0:
+        result = _fill(template=f"CASE WHEN LENGTH(__x__) < {-pos} THEN NULL ELSE __y__ END", value=text.copy(),
+                       second=result)
+    elif pos is None:
+        result = _fill(template="CASE WHEN TRUNC(__x__) < 0 AND -TRUNC(__x__) > LENGTH(__z__) THEN NULL ELSE __y__ END",
+                       value=raw_start.copy(), second=result, more={"__z__": text.copy()})
+    return result
+
+
+# String functions: Oracle converts a number or date argument to text first, and an empty result is NULL.
+_TEXT_FUNCTIONS = (exp.Trim, exp.Upper, exp.Lower, exp.Length, exp.Pad, exp.Replace, exp.Translate, exp.Initcap)
+_EMPTY_IS_NULL = (exp.Trim, exp.Pad, exp.Replace, exp.Translate)
+
+
+def _text_functions(body: exp.Expression, types: _OracleTypes) -> None:
+    """TRIM/LTRIM/RTRIM, UPPER, LOWER, LENGTH, LPAD/RPAD, REPLACE, TRANSLATE, INITCAP of a number or a
+    date: of its text, as Oracle converts it; and '' results (all trimmed or replaced away) are NULL,
+    as in Oracle. Checked against Oracle."""
+    for node in sorted(body.find_all(*_TEXT_FUNCTIONS), key=lambda n: -n.depth):
+        kind = types.of(node.this)
+        if kind in ("NUMBER", "DATE", "TIMESTAMP"):
+            node.set("this", _oracle_text(value=node.this, kind=kind))
+        if isinstance(node, _EMPTY_IS_NULL) and not isinstance(node.parent, exp.Nullif):
+            node.replace(exp.Nullif(this=node.copy(), expression=exp.Literal.string("")))
+
+
+_HASHES = {"SHA1": "sha1", "SHA256": "sha256", "MD5": "md5"}
+
+
+def _standard_hash(node: exp.StandardHash, kind: str | None) -> None:
+    """STANDARD_HASH(text [, 'SHA1'|'SHA256'|'MD5']) -> the digest of the UTF-8 text (a RAW: unhex of
+    DuckDB's hex digest); RAWTOHEX(STANDARD_HASH(...)) -> the upper-case hex digest. Oracle hashes a
+    number or date by its internal bytes, which DuckDB can't reproduce: refused."""
+    method = node.args.get("expression")
+    name = "SHA1" if method is None else (method.this.upper() if isinstance(method, exp.Literal) else None)
+    function = _HASHES.get(name or "")
+    if function is None:
+        raise ViewTranslationError(f"STANDARD_HASH with method {method.sql() if method else ''} (SHA1, SHA256 and "
+                                   "MD5 are translated)")
+    if kind != "STRING":
+        raise ViewTranslationError("STANDARD_HASH of a value that isn't text (Oracle hashes its internal bytes)")
+    digest = exp.Anonymous(this=function, expressions=[node.this])
+    parent = node.parent
+    if isinstance(parent, exp.Anonymous) and str(parent.this).upper() == "RAWTOHEX" and len(parent.expressions) == 1:
+        parent.replace(exp.Upper(this=digest))
+    else:
+        node.replace(exp.Anonymous(this="unhex", expressions=[digest]))
+
+
+_DS_UNITS = {"DAY": 86_400_000_000, "HOUR": 3_600_000_000, "MINUTE": 60_000_000, "SECOND": 1_000_000}
+
+
+def _interval_functions(body: exp.Expression) -> None:
+    """NUMTODSINTERVAL(n, 'unit') -> an interval of exact microseconds; FROM_TZ(ts, zone) -> the
+    TIMESTAMPTZ of that wall-clock time in that zone; RAWTOHEX(raw) -> upper-case hex."""
+    for node in list(body.find_all(exp.Anonymous)):
+        name = str(node.this).upper()
+        if name == "NUMTODSINTERVAL" and len(node.expressions) == 2:
+            unit = node.expressions[1]
+            factor = _DS_UNITS.get(unit.this.upper()) if isinstance(unit, exp.Literal) and unit.is_string else None
+            if factor is None:
+                raise ViewTranslationError("NUMTODSINTERVAL with a unit other than a literal DAY/HOUR/MINUTE/SECOND")
+            node.replace(_fill(template=f"to_microseconds(CAST(ROUND(CAST(__x__ AS DOUBLE) * {factor}) AS BIGINT))",
+                               value=node.expressions[0]))
+        elif name == "FROM_TZ" and len(node.expressions) == 2:
+            node.replace(exp.Anonymous(this="timezone", expressions=[node.expressions[1], node.expressions[0]]))
+        elif name == "RAWTOHEX" and len(node.expressions) == 1:
+            node.replace(exp.Upper(this=exp.Anonymous(this="hex", expressions=[node.expressions[0]])))
+
+
+_COMPARISONS = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)
+
+
+def _all_any_lists(body: exp.Expression) -> None:
+    """x op ALL (a, b, ...) -> x op a AND x op b ...; x op ANY|SOME (a, b, ...) -> ... OR ... (Oracle
+    defines them this way, NULLs included). Subqueries are left alone (DuckDB has those)."""
+    for node in list(body.find_all(*_COMPARISONS)):
+        right = node.expression
+        if isinstance(right, exp.Anonymous) and str(right.this).upper() in ("ALL", "ANY", "SOME"):
+            quantifier, items = str(right.this).upper(), right.expressions
+        elif isinstance(right, (exp.All, exp.Any)) and isinstance(right.this, (exp.Tuple, exp.Paren)):
+            quantifier = "ALL" if isinstance(right, exp.All) else "ANY"
+            items = right.this.expressions if isinstance(right.this, exp.Tuple) else [right.this.this]
+        else:
+            continue
+        if not items or any(isinstance(i, (exp.Select, exp.Subquery)) for i in items):
+            continue
+        parts = [node.__class__(this=node.this.copy(), expression=item) for item in items]
+        combined = exp.and_(*parts) if quantifier == "ALL" else exp.or_(*parts)
+        node.replace(exp.Paren(this=combined))
+
+
+def _recursive_ctes(body: exp.Expression) -> None:
+    """Oracle's recursive WITH needs no keyword; DuckDB's needs WITH RECURSIVE."""
+    for with_ in body.find_all(exp.With):
+        for cte in with_.expressions:
+            if any(not t.db and t.name.upper() == cte.alias.upper() for t in cte.this.find_all(exp.Table)):
+                with_.set("recursive", True)
+
+
+def _source_columns(source: exp.Expression, types: _OracleTypes, default_schema: str) -> list[str] | None:
+    if isinstance(source, exp.Subquery) and isinstance(source.this, exp.Select):
+        names = [p.alias_or_name for p in source.this.expressions]
+        return None if any(not n or n == "*" for n in names) else names
+    if isinstance(source, exp.Table):
+        columns = types.column_types.get(((source.db or default_schema).upper(), source.name.upper()))
+        return list(columns) if columns else None
+    return None
+
+
+def _unpivot_columns(node: exp.Expression) -> list[exp.Expression]:
+    return list(node.expressions) if isinstance(node, exp.Tuple) else [node]
+
+
+def _multi_column_unpivots(body: exp.Expression, types: _OracleTypes, default_schema: str) -> None:
+    """UNPIVOT with several value columns -> UNION ALL, one branch per IN group. DuckDB's own
+    multi-column UNPIVOT drops a row when ANY value is NULL (Oracle: when ALL are) and has one name
+    column only. Output columns in Oracle's order: the others, the FOR columns, the values."""
+    for pivot in list(body.find_all(exp.Pivot)):
+        if not pivot.args.get("unpivot"):
+            continue
+        values = [c for e in pivot.expressions for c in _unpivot_columns(node=e)]
+        field = pivot.args["fields"][0] if pivot.args.get("fields") else None
+        if field is None or (len(values) < 2 and not isinstance(field.this, exp.Tuple)):
+            continue                                    # single-column UNPIVOT: DuckDB matches Oracle
+        source = pivot.parent
+        columns = _source_columns(source=source, types=types, default_schema=default_schema)
+        if columns is None:
+            raise ViewTranslationError("multi-column UNPIVOT over a source whose columns aren't known")
+        names = [c.name for c in _unpivot_columns(node=field.this)]
+        groups = []
+        for entry in field.expressions:
+            inputs = _unpivot_columns(node=entry.this if isinstance(entry, exp.PivotAlias) else entry)
+            labels = _unpivot_columns(node=entry.args["alias"]) if isinstance(entry, exp.PivotAlias) else \
+                [exp.Literal.string("_".join(c.name for c in inputs).upper())]
+            if len(inputs) != len(values) or len(labels) != len(names):
+                raise ViewTranslationError("UNPIVOT with mismatched column groups")
+            groups.append((inputs, labels))
+        used = {c.name.upper() for inputs, _ in groups for c in inputs}
+        others = [c for c in columns if c.upper() not in used]
+        bare = source.copy()
+        bare.set("pivots", None)
+        bare.set("alias", None)
+        branches = []
+        for inputs, labels in groups:
+            projections = [exp.column(c) for c in others] \
+                + [lbl.copy().as_(n) for lbl, n in zip(labels, names, strict=True)] \
+                + [i.copy().as_(v.name) for i, v in zip(inputs, values, strict=True)]
+            select = exp.Select(expressions=projections).from_(bare.copy())
+            if not pivot.args.get("include_nulls"):
+                select = select.where(exp.not_(exp.and_(*[exp.Is(this=i.copy(), expression=exp.null())
+                                                          for i in inputs])))
+            branches.append(select)
+        union = branches[0]
+        for branch in branches[1:]:
+            union = exp.Union(this=union, expression=branch, distinct=False)
+        alias = pivot.args.get("alias") or source.args.get("alias") or exp.TableAlias(this=_quoted(name="unpivoted"))
+        source.replace(exp.Subquery(this=union, alias=alias.copy()))
+
+
+def _rename_columns(body: exp.Expression, renames: dict, types: _OracleTypes, default_schema: str) -> None:
+    """Columns renamed by column rules (`rename`) -> their target names, wherever a view reads them from
+    the renamed table (by alias, or unqualified when only that table has the column). A bare selected
+    column keeps its old name as an alias, so outer queries still find it."""
+    for column in list(body.find_all(exp.Column)):
+        select = column.find_ancestor(exp.Select)
+        if select is None or isinstance(column.this, exp.Star):
+            continue
+        from_ = select.args.get(_FROM)
+        sources = ([from_.this] if from_ is not None else []) + [j.this for j in select.args.get("joins") or []]
+        if column.table:
+            sources = [s for s in sources if s.alias_or_name.upper() == column.table.upper()]
+        elif any(not isinstance(s, exp.Table) for s in sources):
+            continue                                   # an unqualified column that a subquery may provide
+        tables = [s for s in sources if isinstance(s, exp.Table)
+                  and (s.db or not _OracleTypes._cte(node=select, name=s.name))]
+        if not column.table:
+            tables = [t for t in tables if column.name.upper() in types.column_types.get(
+                ((t.db or default_schema).upper(), t.name.upper()), {})]
+        if len(tables) != 1:
+            continue
+        table = tables[0]
+        target = renames.get(((table.db or default_schema).upper(), table.name.upper()), {}).get(column.name.upper())
+        if target is None:
+            continue
+        old = column.name
+        ident = exp.to_identifier(target, quoted=True)
+        ident.meta["final"] = True                      # already the target's name: no naming.case
+        if isinstance(column.parent, exp.Select):
+            renamed = column.copy()
+            renamed.set("this", ident)
+            column.replace(exp.alias_(renamed, old))
+        else:
+            column.set("this", ident)
 
 
 def _is_null(node: exp.Expression | None) -> bool:
@@ -607,10 +897,21 @@ def _is_null(node: exp.Expression | None) -> bool:
 # Oracle pseudo-columns: values only the source database can produce, with the type a NULL
 # stand-in gets. Both are reserved words, so an unquoted reference is never a real column.
 _ORACLE_PSEUDO_COLUMNS = {"ORA_ROWSCN": "DECIMAL(38,0)", "ROWID": "VARCHAR"}
+# an Oracle TIMESTAMP literal: date [time [fraction]] [offset]
+_TIMESTAMP_LITERAL = re.compile(r"\s*(\d{4}-\d{2}-\d{2}(?: \d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?)"
+                                r"\s*([+-]\d{1,2}:\d{2})?\s*")
 
 
-def _oracle_rewrites(body: exp.Expression, pseudo_columns: str = "fail") -> exp.Expression:
+def _oracle_rewrites(body: exp.Expression, pseudo_columns: str = "fail", column_types: dict | None = None,
+                     default_schema: str = "", context_params: list[str] | None = None,
+                     function_types: dict | None = None) -> exp.Expression:
     """Oracle-only constructs with a well-defined DuckDB equivalent."""
+    types = _OracleTypes(column_types=column_types or {}, default_schema=default_schema, function_types=function_types)
+    # type classes first: the rewrites below replace the nodes they are inferred from
+    for node in body.find_all(exp.DPipe, exp.Concat, exp.ToChar, exp.StandardHash, exp.Substring, *_TEXT_FUNCTIONS):
+        for operand in (_concat_operands(node=node) if isinstance(node, exp.DPipe) else
+                        node.expressions if isinstance(node, exp.Concat) else [node.this]):
+            types.of(operand)
     for column in list(body.find_all(exp.Column)):
         name = column.name.upper()
         if name in _ORACLE_PSEUDO_COLUMNS and not column.this.quoted:
@@ -622,6 +923,19 @@ def _oracle_rewrites(body: exp.Expression, pseudo_columns: str = "fail") -> exp.
     # SYS_CONTEXT(namespace, parameter): a value of the Oracle session (application contexts, USERENV).
     # A copy has no such session; NULL is what Oracle returns when the context isn't set.
     for node in list(body.find_all(exp.Anonymous)):
+        if str(node.this).upper() == "SYS_CONTEXT" and context_params is not None:
+            # a parameterized view's macro: SYS_CONTEXT(namespace, 'ATTRIBUTE') -> parameter attribute
+            attribute = node.expressions[1] if len(node.expressions) == 2 else None
+            if not (isinstance(attribute, exp.Literal) and attribute.is_string
+                    and re.fullmatch(r"[A-Za-z_]\w*", attribute.this)):
+                raise ViewTranslationError("SYS_CONTEXT with an attribute that isn't a literal name")
+            name = attribute.this.upper()
+            if name not in context_params:
+                context_params.append(name)
+            param = exp.column(name)
+            param.meta["param"] = True
+            node.replace(param)
+            continue
         if str(node.this).upper() == "SYS_CONTEXT":
             if pseudo_columns != "null":
                 raise ViewTranslationError(
@@ -632,9 +946,42 @@ def _oracle_rewrites(body: exp.Expression, pseudo_columns: str = "fail") -> exp.
     # TO_DATE / TO_TIMESTAMP of NULL is NULL whatever the format (sqlglot emits STRPTIME(x) with no
     # format for TO_DATE(x), which DuckDB rejects). An Oracle DATE keeps seconds: TIMESTAMP_S.
     for node in list(body.find_all(exp.StrToDate, exp.StrToTime)):
+        if isinstance(node.this, exp.Column) and node.this.meta.get("param") and node.args.get("format") is None:
+            node.replace(exp.Cast(this=node.this, to=exp.DataType.build(
+                "TIMESTAMP_S" if isinstance(node, exp.StrToDate) else "TIMESTAMP", dialect="duckdb")))
+            continue
         if _is_null(node=node.this):
             node.replace(exp.Cast(this=exp.null(), to=exp.DataType.build(
                 "TIMESTAMP_S" if isinstance(node, exp.StrToDate) else "TIMESTAMP", dialect="duckdb")))
+
+    _multi_column_unpivots(body=body, types=types, default_schema=default_schema)
+    for node in list(body.find_all(exp.StandardHash)):
+        _standard_hash(node=node, kind=types.of(node.this))
+    _oracle_concat(body=body, types=types)
+    # TO_CHAR(x) without a format: Oracle's implicit text conversion (sqlglot: CAST(x AS TEXT))
+    for node in list(body.find_all(exp.ToChar)):
+        if node.args.get("format") is None and not node.args.get("nlsparam"):
+            node.replace(_oracle_text(value=node.this, kind=types.of(node.this)))
+    for node in sorted(body.find_all(exp.Substring), key=lambda n: -n.depth):
+        node.replace(_substr(node=node, kind=types.of(node.this)))
+    _text_functions(body=body, types=types)
+    _all_any_lists(body=body)
+    _interval_functions(body=body)
+    # TIMESTAMP 'yyyy-mm-dd hh:mi:ss[.ff] [zone]' literals: sqlglot emits STRPTIME(..., '...%S.%f'), which
+    # fails (when the view is queried) without a fraction; Oracle's literal doesn't need one.
+    for node in list(body.find_all(exp.StrToTime)):
+        fmt, value = node.args.get("format"), node.this
+        if isinstance(fmt, exp.Literal) and fmt.this == "%Y-%m-%d %H:%M:%S.%f" and isinstance(value, exp.Literal) \
+                and value.is_string:
+            match = _TIMESTAMP_LITERAL.fullmatch(value.this)
+            if match:      # DuckDB wants the offset attached: 08:30:15-05:00
+                text, zone = match.group(1), match.group(2)
+                node.replace(exp.Cast(this=exp.Literal.string(text + (zone or "")),
+                                      to=exp.DataType.build("TIMESTAMPTZ" if zone else "TIMESTAMP")))
+    # TO_DATE(SYSDATE) round-trips through NLS_DATE_FORMAT (default DD-MON-RR): midnight of that day
+    for node in list(body.find_all(exp.StrToDate)):
+        if node.args.get("format") is None and isinstance(node.this, _NOW_NODES):
+            node.replace(_fill(template="CAST(DATE_TRUNC('day', __x__) AS TIMESTAMP_S)", value=node.this))
 
     for node in sorted(body.find_all(exp.Window), key=lambda n: -n.depth):
         if node.args.get("over") == "KEEP":
@@ -692,9 +1039,10 @@ def _oracle_rewrites(body: exp.Expression, pseudo_columns: str = "fail") -> exp.
         limit = None
         kept = []
         for cond in conditions:
-            if isinstance(cond, (exp.LTE, exp.LT)) and isinstance(cond.this, exp.Column) \
+            if isinstance(cond, (exp.LTE, exp.LT, exp.EQ)) and isinstance(cond.this, exp.Column) \
                     and cond.this.name.upper() == "ROWNUM" and not cond.this.table \
-                    and isinstance(cond.expression, exp.Literal) and cond.expression.is_int:
+                    and isinstance(cond.expression, exp.Literal) and cond.expression.is_int \
+                    and (not isinstance(cond, exp.EQ) or cond.expression.name == "1"):    # ROWNUM = 1: LIMIT 1
                 n = int(cond.expression.name) - (1 if isinstance(cond, exp.LT) else 0)
                 limit = n if limit is None else min(limit, n)
             else:
@@ -705,20 +1053,50 @@ def _oracle_rewrites(body: exp.Expression, pseudo_columns: str = "fail") -> exp.
                 raise ViewTranslationError("ROWNUM combined with ORDER BY / GROUP BY")
             select.set("where", exp.Where(this=exp.and_(*kept)) if kept else None)
             select.limit(limit, copy=False)
+    # DUAL still referenced (joined, e.g. FROM dual OUTER APPLY (...)): a one-row stand-in
+    for table in list(body.find_all(exp.Table)):
+        if not table.db and table.name.upper() == "DUAL" and not _OracleTypes._cte(node=table, name="DUAL"):
+            table.replace(exp.Subquery(this=exp.select(exp.Literal.string("X").as_("DUMMY")),
+                                       alias=exp.TableAlias(this=_quoted(name=table.alias_or_name))))
+    _recursive_ctes(body=body)
     if any(isinstance(c, exp.Column) and c.name.upper() == "ROWNUM" and not c.table
            for c in body.find_all(exp.Column)):
-        raise ViewTranslationError("ROWNUM used other than as a top-level 'ROWNUM <= n' filter")
+        raise ViewTranslationError("ROWNUM used other than as a top-level 'ROWNUM <= n' (or = 1) filter")
     return body
 
 
 _PLACEHOLDER = re.compile(r"\{(\w+)\}")
 
 
+_SIGNATURE = re.compile(r"\s*([\w.$#]+)\s*(?:\(([^)]*)\))?\s*(?:RETURN\s+(\w+(?:\s*\([\d, ]+\))?))?\s*",
+                        re.IGNORECASE)
+
+
+def _function_types(functions: dict[str, str]) -> dict[str, str]:
+    """views.functions keys declaring RETURN <type>: function name -> type class, for date arithmetic
+    and text conversions on their results."""
+    types = {}
+    for key in functions:
+        match = _SIGNATURE.fullmatch(key)
+        if match and match.group(3):
+            kind = _OracleTypes._class(data_type=match.group(3))
+            if kind:
+                types[match.group(1).upper()] = kind
+    return types
+
+
 def _user_functions(body: exp.Expression, functions: dict[str, str]) -> exp.Expression:
     """views.functions: calls of source functions (e.g. PL/SQL) -> the configured DuckDB SQL, with {1},
     {2}, ... standing for the call's arguments by position and {name} for named ones (p_name => x).
-    Package-qualified calls (pkg.fn) are matched as pkg.fn."""
-    templates = {name.upper(): template for name, template in functions.items()}
+    A key may list the parameters, NAME(p1, p2), so that positional and named calls both fill {p1}
+    and {1}. Package-qualified calls (pkg.fn) are matched as pkg.fn."""
+    templates: dict[str, tuple[list[str], str]] = {}
+    for key, template in functions.items():
+        match = _SIGNATURE.fullmatch(key)
+        if match is None:
+            raise ViewTranslationError(f"views.functions key {key!r} isn't NAME [(param, ...)] [RETURN type]")
+        params = [p.strip().upper() for p in (match.group(2) or "").split(",") if p.strip()]
+        templates[match.group(1).upper()] = (params, template)
     for node in list(body.find_all(exp.Anonymous)):
         name = str(node.this).upper()
         if isinstance(node.parent, exp.Dot) and node.parent.expression is node:
@@ -726,15 +1104,20 @@ def _user_functions(body: exp.Expression, functions: dict[str, str]) -> exp.Expr
             target = node.parent
         else:
             target = node
-        template = templates.get(name)
-        if template is None:
+        if name not in templates:
             continue
+        params, template = templates[name]
         args: dict[str, exp.Expression] = {}
         for i, arg in enumerate(node.expressions, start=1):
             if isinstance(arg, (exp.Kwarg, exp.PropertyEQ)):
-                args[arg.this.name.upper()] = arg.expression
+                key = arg.this.name.upper()
+                args[key] = arg.expression
+                if key in params:
+                    args[str(params.index(key) + 1)] = arg.expression
             else:
                 args[str(i)] = arg
+                if i <= len(params):
+                    args[params[i - 1]] = arg
         missing = sorted({m.upper() for m in _PLACEHOLDER.findall(template)} - set(args))
         if missing:
             raise ViewTranslationError(f"views.functions[{name}] uses {{{missing[0].lower()}}}, which this "
@@ -754,7 +1137,9 @@ def translate_view(definition: str, source_dialect: str, view_db_schema: str, ta
                    source_columns: list[str] | None = None, target_catalog: str | None = None,
                    pseudo_columns: str = "fail", time_zone: str | None = None,
                    column_types: dict[tuple[str, str], dict[str, str]] | None = None,
-                   functions: dict[str, str] | None = None) -> str:
+                   functions: dict[str, str] | None = None,
+                   column_renames: dict[tuple[str, str], dict[str, str]] | None = None,
+                   as_macro: bool = False) -> str | None:
     """Return a DuckDB-dialect CREATE OR REPLACE VIEW for a source view definition.
 
     - Accepts a bare SELECT or a full CREATE VIEW; only the query body is kept, so
@@ -788,12 +1173,34 @@ def translate_view(definition: str, source_dialect: str, view_db_schema: str, ta
         raise ViewTranslationError("the view definition isn't a query")
 
     body = normalize_identifiers(body, dialect=source_dialect)
-    if functions:
-        body = _user_functions(body=body, functions=functions)
+    function_types = _function_types(functions=functions or {})
+    if column_renames:
+        _rename_columns(body=body, renames=column_renames, default_schema=view_db_schema,
+                        types=_OracleTypes(column_types=column_types or {}, default_schema=view_db_schema))
+    context_params: list[str] | None = [] if as_macro else None
     if source_dialect == "oracle":
-        body = _oracle_rewrites(body=body, pseudo_columns=pseudo_columns)
+        body = _oracle_rewrites(body=body, pseudo_columns=pseudo_columns, column_types=column_types,
+                                default_schema=view_db_schema, context_params=context_params,
+                                function_types=function_types)
+    if as_macro and not context_params:
+        return None                                # not a parameterized view
+    if as_macro:
+        # A macro parameter shadows an unqualified column of the same name: qualify such a column with
+        # its query's only source, or refuse when there are several.
+        for column in list(body.find_all(exp.Column)):
+            if column.meta.get("param") or column.table or column.name.upper() not in context_params:
+                continue
+            select = column.find_ancestor(exp.Select)
+            from_ = select.args.get(_FROM) if select is not None else None
+            if from_ is None or select.args.get("joins") or not from_.this.alias_or_name:
+                raise ViewTranslationError(f"SYS_CONTEXT attribute {column.name.upper()} is also a column name "
+                                           "in a query with several sources; a macro parameter would shadow it")
+            column.set("table", exp.to_identifier(from_.this.alias_or_name))
+    if source_dialect == "oracle":
         body = _oracle_dates(body=body, time_zone=time_zone, column_types=column_types or {},
-                             default_schema=view_db_schema)
+                             default_schema=view_db_schema, function_types=function_types)
+    if functions:      # DuckDB SQL: after the source-dialect rewrites, which mustn't touch it
+        body = _user_functions(body=body, functions=functions)
     body = qualify_tables(body, db=_quoted(name=view_db_schema), dialect=source_dialect)
 
     table_nodes = set()
@@ -812,7 +1219,7 @@ def translate_view(definition: str, source_dialect: str, view_db_schema: str, ta
         table.set("catalog", _catalog_qualifier(db_schema=table.db, catalog=target_catalog))
 
     for ident in body.find_all(exp.Identifier):
-        if id(ident) not in table_nodes:
+        if id(ident) not in table_nodes and not ident.meta.get("final"):
             ident.set("this", apply_case(name=ident.this, case=case))
             ident.set("quoted", True)
 
@@ -820,6 +1227,18 @@ def translate_view(definition: str, source_dialect: str, view_db_schema: str, ta
     # DuckDB rejects. [LEFT] JOIN LATERAL (...) ON TRUE is exactly what APPLY means.
     for join in body.find_all(exp.Join):
         lateral = join.this
+        # APPLY over a parenthesized table name (OUTER APPLY (t) x): just that table, joined ON TRUE
+        if isinstance(lateral, exp.Lateral) and lateral.args.get("cross_apply") is not None \
+                and isinstance(lateral.this, exp.Subquery) and isinstance(lateral.this.this, exp.Table) \
+                and not join.args.get("on"):
+            table = lateral.this.this.copy()
+            if lateral.args.get("alias"):
+                table.set("alias", lateral.args["alias"].copy())
+            if lateral.args["cross_apply"] is False:
+                join.set("side", "LEFT")
+            join.set("this", table)
+            join.set("on", exp.true())
+            continue
         if isinstance(lateral, exp.Lateral) and lateral.args.get("cross_apply") is not None \
                 and not join.args.get("on") and not join.args.get("using"):
             outer = lateral.args["cross_apply"] is False
@@ -841,9 +1260,13 @@ def translate_view(definition: str, source_dialect: str, view_db_schema: str, ta
                               unsupported_level=ErrorLevel.RAISE)
     except UnsupportedError as e:
         raise ViewTranslationError("no faithful DuckDB translation: " + "; ".join(str(e).splitlines())) from e
+    columns = [apply_case(name=c, case=case) for c in column_list] if column_list else None
+    if as_macro:
+        return create_macro_sql(target_db_schema=target_db_schema, target_view=target_view, body=select_sql,
+                                columns=columns, params=[apply_case(name=p, case=case) for p in context_params],
+                                target_catalog=target_catalog)
     return create_view_sql(target_db_schema=target_db_schema, target_view=target_view, body=select_sql,
-                           columns=[apply_case(name=c, case=case) for c in column_list] if column_list else None,
-                           target_catalog=target_catalog)
+                           columns=columns, target_catalog=target_catalog)
 
 
 def _catalog_qualifier(db_schema: str, catalog: str | None) -> exp.Identifier | None:
@@ -862,6 +1285,21 @@ def create_view_sql(target_db_schema: str, target_view: str, body: str, columns:
     if columns:
         cols = " (" + ", ".join(exp.to_identifier(c, quoted=True).sql(dialect="duckdb") for c in columns) + ")"
     return f"CREATE OR REPLACE VIEW {name}{cols} AS\n{body.strip().rstrip(';')}"
+
+
+def create_macro_sql(target_db_schema: str, target_view: str, body: str, params: list[str],
+                     columns: list[str] | None = None, target_catalog: str | None = None) -> str:
+    """A table macro named like the view: SELECT * FROM view(param := value, ...); every parameter
+    defaults to NULL, which is what the view itself reads."""
+    view_sql = create_view_sql(target_db_schema=target_db_schema, target_view=target_view, body="SELECT 1",
+                               target_catalog=target_catalog)
+    name = view_sql[len("CREATE OR REPLACE VIEW "):view_sql.index(" AS\n")]
+    signature = ", ".join(f"{exp.to_identifier(p, quoted=True).sql(dialect='duckdb')} := NULL" for p in params)
+    query = body.strip().rstrip(";")
+    if columns:
+        aliases = ", ".join(exp.to_identifier(c, quoted=True).sql(dialect="duckdb") for c in columns)
+        query = f"SELECT * FROM (\n{query}\n) AS \"_view\"({aliases})"
+    return f"CREATE OR REPLACE MACRO {name}({signature}) AS TABLE\n{query}"
 
 
 def load_override(overrides_dir: str | None, db_schema: str, view: str) -> str | None:

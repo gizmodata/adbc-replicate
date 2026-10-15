@@ -387,6 +387,12 @@ Views are recreated in the target after the tables, in DuckDB SQL:
   `CONNECT BY LEVEL <= n` row generators) become `WITH RECURSIVE` queries;
   `MIN/MAX(...) KEEP (DENSE_RANK FIRST/LAST ORDER BY ...)` becomes `min_by`/`max_by`; `INSTR`
   with a start position (also negative: searching backward) or an occurrence is computed exactly;
+  multi-column `UNPIVOT`, recursive `WITH`, `x = ALL (a, b)`, `ROWNUM = 1`, `FROM_TZ`,
+  `NUMTODSINTERVAL`, `STANDARD_HASH` / `RAWTOHEX` and `OUTER APPLY (cte)` are translated too;
+- Oracle's string semantics are kept: `||` and `CONCAT` treat NULL as an empty string (DuckDB's
+  `||` returns NULL), an empty result is NULL, numbers and dates turn into text the way Oracle
+  prints them (`1.50` → `1.5`, `0.5` → `.5`, a DATE as `DD-MON-RR`), and `SUBSTR`, `TRIM`,
+  `LPAD`, `REPLACE`, ... follow Oracle's rules for positions, lengths and empty results;
 - Oracle date semantics are kept: `CAST(x AS DATE)` keeps the time of day, `TRUNC(date)` and
   `TRUNC(date, 'MM')` become `DATE_TRUNC`, and `TO_CHAR` formats with an exact DuckDB
   equivalent (`YYYYMMDD`, `HH24:MI`, `DAY`, `fm0000000`, `fm999,990`, ...) are rewritten; the
@@ -405,16 +411,27 @@ views:
   on_failure: materialize            # or: report (default)
   source_time_zone: America/New_York # the source's clock, for SYSDATE & co (Oracle)
   source_pseudo_columns: "null"      # Oracle ORA_ROWSCN / ROWID / SYS_CONTEXT(...) in views: fail (default) | null
+  sys_context_macros: true           # parameterized views (SYS_CONTEXT) also get a table macro
   functions:                         # your own source functions (e.g. PL/SQL), as DuckDB SQL
     # {1}, {2}, ... are the call's arguments by position, {p_name} a named one (p_name => x);
     # package functions are keyed PKG.FN
     BOM_FACTOR: >-
       CAST(coalesce(list_product(list_transform(string_split(substring({1}, 2), '/'),
       lambda q: coalesce(CAST(NULLIF(q, '') AS DOUBLE), 1))), 1) AS DECIMAL(38,10))
+    # list the parameters so positional and named calls both work; RETURN DATE makes
+    # "next_weekday(d) + 1" Oracle date arithmetic (days)
+    NEXT_WEEKDAY(p_date) RETURN DATE: >-
+      {p_date} + to_days(CASE isodow({p_date}) WHEN 5 THEN 3 WHEN 6 THEN 2 ELSE 1 END)
 ```
 
 `SYS_CONTEXT(...)` reads as NULL with `source_pseudo_columns: "null"`: what Oracle returns in a
-session that set no context, so "parameterized views" behave as if no parameter was passed.
+session that set no context, so "parameterized views" behave as if no parameter was passed. With
+`sys_context_macros: true` such a view also gets a DuckDB table macro of the same name, with one
+parameter per context attribute (default NULL), so the parameters can still be passed:
+
+```sql
+SELECT * FROM erp.invoices_as_of(cutoff_date := DATE '2025-12-31');
+```
 
 A view that calls any other source-only function can't be translated: rewrite the function in
 `views.functions`, or list the view in `objects[].materialize_views` to copy its rows instead

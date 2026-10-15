@@ -102,7 +102,7 @@ def test_constructs_sqlglot_would_silently_change_are_refused(definition):
 def test_to_number_becomes_an_exact_decimal_and_hints_are_dropped():
     sql = tr(definition="SELECT /*+ FULL(e) */ TO_NUMBER(code) AS n, TO_CHAR(id) AS s FROM emp e")
     assert 'CAST("code" AS DECIMAL(38, 10)) AS "n"' in sql
-    assert 'CAST("id" AS TEXT) AS "s"' in sql
+    assert 'TYPEOF("id")' in sql and 'ELSE CAST("id" AS TEXT)' in sql    # Oracle's number text, decided at run time
     assert "FULL" not in sql and "/*" not in sql
 
 
@@ -218,3 +218,36 @@ def test_configured_functions_replace_source_functions():
         translate_view(definition="SELECT pkg.fmt(p_value => id) AS s FROM t", source_dialect="oracle",
                        view_db_schema="HR", target_db_schema="hr", target_view="v", name_map={}, case="lower",
                        functions=functions)
+
+
+def test_renamed_columns_are_repointed_in_views():
+    renames = {("HR", "QUOTES"): {"ROW_ID": "source_row_id"}}
+    types = {("HR", "QUOTES"): {"ID": "NUMBER", "ROW_ID": "NUMBER"}, ("HR", "LINES"): {"ID": "NUMBER", "QUOTE_ID": "NUMBER"}}
+    sql = translate_view(definition="SELECT q.row_id, x.rid, row_id + 1 AS next_id FROM quotes q, "
+                                    "(SELECT row_id AS rid FROM quotes) x WHERE q.row_id = x.rid",
+                         source_dialect="oracle", view_db_schema="HR", target_db_schema="hr", target_view="v",
+                         name_map={}, case="lower", column_types=types, column_renames=renames)
+    assert '"q"."source_row_id" AS "row_id"' in sql                   # a bare column keeps its name
+    assert '"source_row_id" AS "rid"' in sql and 'WHERE\n  "q"."source_row_id" = "x"."rid"' in sql
+    assert '"row_id" + 1' in sql             # unqualified with a subquery in scope: left alone (ambiguous)
+    sql = translate_view(definition="SELECT l.id, q.row_id FROM lines l JOIN quotes q ON q.id = l.quote_id",
+                         source_dialect="oracle", view_db_schema="HR", target_db_schema="hr", target_view="v",
+                         name_map={}, case="upper", column_types=types, column_renames=renames)
+    assert '"Q"."source_row_id" AS "ROW_ID"' in sql                    # the target name isn't re-cased
+
+
+def test_configured_function_signatures_and_return_types():
+    functions = {"ADD_DAYS(start_date, n) RETURN DATE": "{start_date} + to_days(CAST({n} AS INTEGER))"}
+    for call in ("ADD_DAYS(hired, 3)", "ADD_DAYS(n => 3, start_date => hired)"):
+        sql = translate_view(definition=f"SELECT {call} - 7 AS d FROM emp", source_dialect="oracle",
+                             view_db_schema="HR", target_db_schema="hr", target_view="v", name_map={}, case="lower",
+                             functions=functions, column_types={("HR", "EMP"): {"HIRED": "DATE"}})
+        assert '"hired" + TO_DAYS(CAST(3 AS INT))' in sql, sql
+        assert "MAKE_TIMESTAMP(" in sql, sql            # RETURN DATE: "- 7" is Oracle date arithmetic (days)
+
+
+def test_configured_package_function_with_signature():
+    sql = translate_view(definition="SELECT erp_pkg.cost(p_item => i.id) AS c, erp_pkg.cost(i.id) AS d FROM items i",
+                         source_dialect="oracle", view_db_schema="HR", target_db_schema="hr", target_view="v", name_map={},
+                         case="lower", functions={"ERP_PKG.COST(p_item) RETURN NUMBER": "({p_item} * 2)"})
+    assert sql.count('"i"."id" * 2') == 2 and "erp_pkg" not in sql.lower()

@@ -193,6 +193,7 @@ def plan(config_path, env_file, fmt, show_sql, only) -> None:
                                          pseudo_columns=config.views.source_pseudo_columns,
                                          time_zone=config.views.source_time_zone,
                                          functions=config.views.functions,
+                                         column_renames=the_plan.column_renames,
                                          column_types=the_plan.column_types)
                     entry["status"] = "translates"
                 if show_sql:

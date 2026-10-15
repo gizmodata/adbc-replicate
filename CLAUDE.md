@@ -72,7 +72,11 @@ charts/adbc-replicate             Helm CronJob
   Eastern); passes Oracle `TRUNC` units ('DD') and unknown functions through unchanged (those
   fail loudly in DuckDB). views.py rewrites or refuses each; rewrites of Oracle functions are
   compared with real Oracle in `tests/integration/test_oracle_view_functions.py` — extend it
-  with every new rewrite.
+  with every new rewrite, with NULL, decimal and date inputs.
+- sqlglot also passes Oracle `||` through, and DuckDB's `||` is NULL if either side is (Oracle: '');
+  Oracle's '' is NULL, so string functions' empty results must become NULL; numbers and dates
+  turn into text Oracle's way (`_oracle_text`). DuckDB's multi-column UNPIVOT drops a row when any
+  value is NULL (Oracle: all), so it's rewritten as UNION ALL.
 - GizmoSQL behind nginx: long DuckDB error texts (DuckLake commit failures, view binder errors
   quoting the whole statement) arrive as `RST_STREAM INTERNAL_ERROR` instead of the message.
   Reproduce against a local DuckDB file target (`--row-limit 0`, schema only) to read them.

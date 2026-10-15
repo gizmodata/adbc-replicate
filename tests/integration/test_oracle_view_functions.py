@@ -253,6 +253,11 @@ HIERARCHIES = [
     # of every row (2 + 4 + 8)
     "SELECT LEVEL AS n FROM dual CONNECT BY LEVEL <= 6",
     f"SELECT id, LEVEL AS n FROM ({ONE_TWO}) CONNECT BY LEVEL <= 3",
+    # a hierarchy per row, inside a correlated scalar subquery (like a PL/SQL function rewritten
+    # through views.functions), using CONNECT_BY_ISLEAF and one anchor
+    "SELECT o.child_id, (SELECT COUNT(*) FROM (SELECT CONNECT_BY_ISLEAF AS leaf, child_id FROM t "
+    "START WITH child_id = o.child_id AND ROWNUM = 1 CONNECT BY PRIOR child_id = parent_id) h WHERE h.leaf = 1) AS leaves "
+    "FROM t o",
     # a hierarchy over a hierarchy (ancestor/descendant pairs keyed on the first one's numbering)
     "WITH tree AS (SELECT child_id, parent_id, ROWNUM AS sort_key, CONNECT_BY_ROOT child_id AS root_id FROM t "
     "START WITH parent_id IS NULL CONNECT BY PRIOR child_id = parent_id ORDER SIBLINGS BY code) "
@@ -312,3 +317,118 @@ def test_connect_by_nocycle_matches_oracle(oracle, gizmosql, prefix):
     query(conn=gizmosql, sql=translate_view(definition=definition, source_dialect="oracle", view_db_schema=schema.upper(),
                                             target_db_schema=schema, target_view="v", name_map={}, case="lower"))
     assert _normalized(query(conn=gizmosql, sql=f"SELECT * FROM {schema}.v")) == expected
+
+
+# Implicit text conversion and other expressions, each run in Oracle and, translated, in GizmoSQL on
+# the same row. n: NUMBER(10,2) (DECIMAL(38,10) in the target, as unconstrained NUMBER loads),
+# d: DATE, s: VARCHAR2, z: NULL.
+EXPRESSION_CASES = [
+    # || and CONCAT: NULL is '', all-NULL is NULL, numbers / dates as Oracle prints them
+    "s || z", "z || z", "s || '-' || z || '-' || n", "CONCAT(z, s)", "CONCAT(z, z)", "'(qty: ' || n || ')'",
+    "'Due ' || d", "n || ''", "TO_CHAR(n)", "TO_CHAR(n2)", "TO_CHAR(d)", "TO_CHAR(i)", "LENGTH(s || z)",
+    # SUBSTR: position 0, fractions, negatives, beyond the end, length below 1, numbers
+    "SUBSTR(s, 0, 2)", "SUBSTR(s, n2, 2)", "SUBSTR(s, -3)", "SUBSTR(s, -20)", "SUBSTR(s, 20)", "SUBSTR(s, 2, 0)",
+    "SUBSTR(s, 2, n2 - 1)", "SUBSTR(s, 2, -1)", "SUBSTR(s, -n2 * 10)", "SUBSTR(s, -n2)", "SUBSTR(i, 2, 2)", "NVL(SUBSTR(s, 20), 'empty')",
+    # string functions of numbers and dates (converted to text first), empty results (NULL)
+    "TRIM(i)", "LTRIM(n2, '2')", "RTRIM(n, '5')", "LENGTH(n)", "UPPER(d)", "LPAD(i, 5, '0')", "RPAD(n, 6, '*')",
+    "REPLACE(n, '.', ',')", "TRANSLATE(i, '4', '9')", "TRIM('   ')", "REPLACE(s, s, '')", "NVL(TRIM('  '), 'null')",
+    "LPAD(s, 0)", "LENGTH(TRIM(' a '))",
+    # TO_CHAR(n, '000'): the sign position, rounding, overflow
+    "TO_CHAR(i, '000')", "TO_CHAR(-i, '000')", "TO_CHAR(n2, '000')", "TO_CHAR(12345, '000')", "TO_CHAR(-0.4, '000')",
+    "'ND' || TO_CHAR(TO_NUMBER(TRIM('  7 ')), '000')",
+    # ALL / ANY over a list
+    "CASE WHEN 0 = ALL (z0, z0) THEN 'y' ELSE 'n' END", "CASE WHEN 0 = ALL (z0, i) THEN 'y' ELSE 'n' END",
+    "CASE WHEN i > ANY (1, 100) THEN 'y' ELSE 'n' END", "CASE WHEN 0 = ALL (z0, z) THEN 'y' ELSE 'n' END",
+    # hashes of text
+    "RAWTOHEX(STANDARD_HASH(s || '|' || TO_CHAR(d, 'YYYY-MM-DD')))", "RAWTOHEX(STANDARD_HASH(s, 'SHA256'))",
+    "RAWTOHEX(STANDARD_HASH(s, 'MD5'))",
+    # TIMESTAMP literals with and without a fraction or a zone offset
+    "TO_CHAR(TIMESTAMP '2026-10-12 08:30:15', 'YYYY-MM-DD HH24:MI:SS')", "TO_CHAR(TIMESTAMP '2026-10-12 08:30:15.25', 'SS')",
+    "TO_CHAR(CAST(TIMESTAMP '2026-10-12 08:30:15 -05:00' AT TIME ZONE 'UTC' AS TIMESTAMP), 'YYYY-MM-DD HH24:MI:SS')",
+    "CASE WHEN d < TIMESTAMP '2026-03-08 09:05:08' THEN 'before' END",
+    "TO_CHAR(d + NUMTODSINTERVAL(5400, 'SECOND'), 'YYYY-MM-DD HH24:MI:SS')",
+    "TO_CHAR(d - NUMTODSINTERVAL(3, 'DAY'), 'YYYY-MM-DD HH24:MI:SS')",
+    # FROM_TZ and NUMTODSINTERVAL (a DST-crossing date)
+    "TO_CHAR(CAST((FROM_TZ(CAST(TRUNC(d) AS TIMESTAMP), 'America/New_York') + NUMTODSINTERVAL(14.5, 'HOUR')) "
+    "AT TIME ZONE 'UTC' AS TIMESTAMP), 'YYYY-MM-DD HH24:MI:SS')",
+    "TO_CHAR(CAST(FROM_TZ(CAST(d2 AS TIMESTAMP), 'America/New_York') AT TIME ZONE 'America/Los_Angeles' AS TIMESTAMP), "
+    "'YYYY-MM-DD HH24:MI:SS')",
+]
+
+
+def test_expressions_match_oracle(oracle, gizmosql, prefix):
+    schema = f"{prefix}_ex"
+    query(conn=gizmosql, sql=f"CREATE SCHEMA {schema}")
+    query(conn=gizmosql, sql=f"CREATE TABLE {schema}.t AS SELECT CAST(1.50 AS DECIMAL(38,10)) AS n, "
+                             "CAST(2.7 AS DECIMAL(38,10)) AS n2, CAST(42 AS DECIMAL(10,0)) AS i, "
+                             "TIMESTAMP '2026-03-08 09:05:07' AS d, TIMESTAMP '2026-11-01 01:30:00' AS d2, "
+                             "'Hello World' AS s, CAST(NULL AS VARCHAR) AS z, CAST(0 AS DECIMAL(10,0)) AS z0")
+    oracle_row = ("SELECT CAST(1.50 AS NUMBER(10,2)) AS n, CAST(2.7 AS NUMBER(10,2)) AS n2, CAST(42 AS NUMBER(10)) AS i, "
+                  "TO_DATE('2026-03-08 09:05:07', 'YYYY-MM-DD HH24:MI:SS') AS d, "
+                  "TO_DATE('2026-11-01 01:30:00', 'YYYY-MM-DD HH24:MI:SS') AS d2, "
+                  "CAST('Hello World' AS VARCHAR2(20)) AS s, CAST(NULL AS VARCHAR2(5)) AS z, 0 AS z0 FROM dual")
+    types = {(schema.upper(), "T"): {"N": "NUMBER", "N2": "NUMBER", "I": "NUMBER", "D": "DATE", "D2": "DATE",
+                                     "S": "VARCHAR2", "Z": "VARCHAR2", "Z0": "NUMBER"}}
+    mismatches = []
+    for i, expression in enumerate(EXPRESSION_CASES):
+        expected = query(conn=oracle, sql=f"SELECT {expression} FROM ({oracle_row})")[0][0]
+        sql = translate_view(definition=f"SELECT {expression} AS r FROM t", source_dialect="oracle",
+                             view_db_schema=schema.upper(), target_db_schema=schema, target_view=f"v{i}", name_map={},
+                             case="lower", column_types=types)
+        query(conn=gizmosql, sql=sql)
+        actual = query(conn=gizmosql, sql=f"SELECT r FROM {schema}.v{i}")[0][0]
+        if not isinstance(expected, (str, type(None))):
+            expected, actual = float(expected), None if actual is None else float(actual)
+        if actual != expected:
+            mismatches.append(f"{expression}: Oracle {expected!r}, translated {actual!r}")
+    assert not mismatches, "\n".join(mismatches)
+
+
+# Query shapes: whole rows compared (sorted) between Oracle and the translated view in GizmoSQL.
+SHAPE_ROWS = [(1, "'A'", 10, 5, None), (1, "'B'", 20, None, 7), (2, "'C'", None, None, None), (2, "'D'", 40, 8, 9),
+              (3, "'E'", 50, 1, 2)]
+SHAPES = [
+    # top-1 per filter from an ordered subquery (ROWNUM = 1 -> LIMIT 1), and in a correlated subquery
+    "SELECT * FROM (SELECT grp, code FROM t WHERE a IS NOT NULL ORDER BY a DESC) WHERE ROWNUM = 1",
+    "SELECT t1.code, (SELECT t2.code FROM t t2 WHERE t2.grp = t1.grp AND t2.code > t1.code AND ROWNUM = 1) AS next_code "
+    "FROM t t1",
+    # OUTER APPLY over a parenthesized CTE name, from DUAL
+    "WITH c AS (SELECT grp, code FROM t WHERE grp = 1) SELECT data.code FROM dual OUTER APPLY (c) data",
+    "WITH c AS (SELECT grp, code FROM t WHERE grp = 9) SELECT data.code FROM dual OUTER APPLY (c) data",
+    # Oracle's recursive WITH (no RECURSIVE keyword)
+    "WITH r (n, total) AS (SELECT 1, 1 FROM dual UNION ALL SELECT n + 1, total * 2 FROM r WHERE n < 5) "
+    "SELECT n, total FROM r",
+    # multi-column UNPIVOT: EXCLUDE NULLS drops a group only when all its values are NULL
+    "SELECT * FROM (SELECT grp, code, a, b, c FROM t) UNPIVOT ((v1, v2) FOR (kind, slot) IN "
+    "((a, b) AS ('AB', 1), (b, c) AS ('BC', 2)))",
+    "SELECT code, kind, v1, v2 FROM (SELECT grp, code, a, b, c FROM t) main_query UNPIVOT INCLUDE NULLS ((v1, v2) FOR kind "
+    "IN ((a, b) AS 'AB', (b, c) AS 'BC')) WHERE code <> 'E'",
+    # TO_DATE(SYSDATE): midnight today (NLS_DATE_FORMAT DD-MON-RR)
+    "SELECT CASE WHEN TO_DATE(SYSDATE) = TRUNC(SYSDATE) THEN 'midnight' END AS r FROM dual",
+]
+
+
+def test_query_shapes_match_oracle(oracle, gizmosql, prefix):
+    schema = f"{prefix}_qs"
+    data = " UNION ALL ".join(f"SELECT {g} AS grp, CAST({code} AS VARCHAR2(5)) AS code, {'NULL' if a is None else a} AS a, "
+                              f"{'NULL' if b is None else b} AS b, {'NULL' if c is None else c} AS c FROM dual"
+                              for g, code, a, b, c in SHAPE_ROWS)
+    query(conn=gizmosql, sql=f"CREATE SCHEMA {schema}")
+    query(conn=gizmosql, sql=f"CREATE TABLE {schema}.t AS SELECT CAST(grp AS DECIMAL(10,0)) AS grp, CAST(code AS VARCHAR) "
+                             "AS code, CAST(a AS DECIMAL(10,0)) AS a, CAST(b AS DECIMAL(10,0)) AS b, "
+                             f"CAST(c AS DECIMAL(10,0)) AS c FROM ({data.replace(' FROM dual', '').replace('VARCHAR2(5)', 'VARCHAR')})")
+    types = {(schema.upper(), "T"): {"GRP": "NUMBER", "CODE": "VARCHAR2", "A": "NUMBER", "B": "NUMBER", "C": "NUMBER"}}
+    mismatches = []
+    for i, definition in enumerate(SHAPES):
+        with_data = f"WITH t AS ({data}) "
+        oracle_sql = with_data + definition if not definition.startswith("WITH ") \
+            else with_data.rstrip() + ", " + definition[len("WITH "):]
+        expected = _normalized(query(conn=oracle, sql=oracle_sql))
+        sql = translate_view(definition=definition, source_dialect="oracle", view_db_schema=schema.upper(),
+                             target_db_schema=schema, target_view=f"v{i}", name_map={}, case="lower",
+                             column_types=types, time_zone="UTC")
+        query(conn=gizmosql, sql=sql)
+        actual = _normalized(query(conn=gizmosql, sql=f"SELECT * FROM {schema}.v{i}"))
+        if actual != expected:
+            mismatches.append(f"{definition}\n  Oracle:     {expected}\n  translated: {actual}")
+    assert not mismatches, "\n".join(mismatches)

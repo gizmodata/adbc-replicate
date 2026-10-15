@@ -24,9 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SYS_CONTEXT(...)` reads as NULL with `views.source_pseudo_columns: "null"` (what Oracle returns
   when the context isn't set), and `TO_DATE`/`TO_TIMESTAMP` of NULL is a typed NULL.
 - `views.functions`: rewrite your own source functions (e.g. PL/SQL) as DuckDB SQL templates,
-  with `{1}`, `{2}`, ... for positional and `{p_name}` for named arguments.
+  with `{1}`, `{2}`, ... for positional and `{p_name}` for named arguments. A key can list the
+  parameters, `NAME(p1, p2)`, so positional and named calls both work, and declare `RETURN DATE`
+  (or NUMBER, VARCHAR2) so date arithmetic and text conversions on the result are translated.
+- `views.sys_context_macros`: a parameterized Oracle view (reading `SYS_CONTEXT`) also gets a DuckDB
+  table macro of the same name, one parameter per context attribute (default NULL):
+  `SELECT * FROM v(attribute := value)`.
+- More Oracle translations: multi-column `UNPIVOT` (as `UNION ALL`; DuckDB's own drops a row when
+  any value is NULL, Oracle's only when all are), recursive `WITH` without the `RECURSIVE` keyword,
+  `x op ALL/ANY (list)`, `ROWNUM = 1`, `FROM_TZ`, `NUMTODSINTERVAL`, `STANDARD_HASH`/`RAWTOHEX`,
+  `TO_CHAR(n, '000')`, `TO_DATE(SYSDATE)`, `OUTER APPLY (cte)` and `DUAL` in joins; columns renamed by
+  column rules are re-pointed in views. Type inference follows `WITH c (a, b) AS (...)` column lists.
 - Each of these is checked row by row against Oracle in the integration tests. On a real
-  303-view Oracle schema, 45 more views now replicate (217 -> 262).
+  303-view Oracle schema, 73 more views now replicate (217 -> 290, of 296 not excluded).
 
 ### Changed
 
@@ -34,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Oracle `||` and `CONCAT` were passed through to DuckDB, whose `||` returns NULL when either side
+  is NULL (Oracle treats NULL as ''), so any translated view concatenating a nullable column could
+  return NULL where Oracle returns text; numbers and dates also turned into DuckDB's text
+  (`1.5000000000`, `2026-03-08 09:05:07`) instead of Oracle's (`1.5`, `08-MAR-26`). Now
+  `NULLIF(CONCAT(...), '')` with Oracle's conversions. `TO_CHAR(x)`, `SUBSTR` (position 0,
+  fractions, negative positions, lengths below 1), `TRIM`/`LPAD`/`REPLACE`/... of numbers, and their
+  empty results (NULL in Oracle) follow Oracle too.
+- Oracle `TIMESTAMP '...'` literals became `STRPTIME(..., '%Y-%m-%d %H:%M:%S.%f')`, which fails when
+  the view is queried (not when it's created) unless the literal has a fraction; now a cast, with
+  the zone offset kept.
 - `INSTR(s, sub, -1)` (the last occurrence) was translated by sqlglot as a check of the last
   character only, silently returning wrong positions; and `INSTR(s, sub, 1, 1)` was refused.
 

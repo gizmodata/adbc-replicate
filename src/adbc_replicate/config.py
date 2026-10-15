@@ -253,11 +253,20 @@ class ViewsConfig(_Model):
                     "filled with a typed NULL; also reads Oracle SYS_CONTEXT(...) as NULL (what Oracle returns "
                     "when the context isn't set).",
     )
+    sys_context_macros: bool = Field(
+        default=False,
+        description="Oracle parameterized views (reading SYS_CONTEXT(namespace, 'ATTRIBUTE')) also get a "
+                    "DuckDB table macro of the same name with one parameter per attribute (lower-cased, "
+                    "default NULL): SELECT * FROM view(attribute := value). The view itself reads them as "
+                    "NULL (source_pseudo_columns: null).",
+    )
     functions: dict[str, str] = Field(
         default_factory=dict,
         description="Source functions (e.g. your own PL/SQL) rewritten as DuckDB SQL in translated views: "
                     "{1}, {2}, ... are the call's arguments by position, {name} a named argument (p_name => x). "
-                    "Package functions are keyed pkg.fn. Example: BOM_FACTOR: \"list_product(...)\".",
+                    "Key NAME(p1, p2) to list the parameters, so positional and named calls both fill {p1} and "
+                    "{1}, and add RETURN DATE (or NUMBER, VARCHAR2, ...) so date arithmetic on the result is "
+                    "translated. Package functions are keyed pkg.fn. Example: BOM_FACTOR: \"list_product(...)\".",
     )
 
 

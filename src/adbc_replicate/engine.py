@@ -12,6 +12,7 @@ import time
 import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
+from functools import partial
 
 from . import __version__
 from .arrowutil import coalesce, counting, transform
@@ -393,6 +394,7 @@ class Replicator:
 
         failures: dict[str, str] = {}
         statements: dict[tuple[str, str], str] = {}
+        macros: dict[tuple[str, str], str] = {}
         for view in plan.views:
             name = view.source.qualified_name
             try:
@@ -406,16 +408,28 @@ class Replicator:
                 definition = definitions.get((view.source.db_schema, view.source.name))
                 if not definition:
                     raise ViewTranslationError("the source returned no definition (no privilege on it?)")
-                statements[view.target_key] = translate_view(
+                translate = partial(translate_view,
                     definition=definition, source_dialect=self.source.dialect,
                     view_db_schema=view.source.db_schema, target_db_schema=view.target_db_schema,
                     target_view=view.target_view, name_map=plan.name_map, case=self.config.naming.case,
                     source_columns=[c.name for c in view.source.columns], target_catalog=self.target.catalog,
                     pseudo_columns=self.config.views.source_pseudo_columns,
                     time_zone=self.config.views.source_time_zone, column_types=plan.column_types,
-                    functions=self.config.views.functions)
+                    functions=self.config.views.functions, column_renames=plan.column_renames)
+                statements[view.target_key] = translate()
             except Exception as e:
                 failures[name] = f"translation: {e}"
+                continue
+            # a parameterized view (SYS_CONTEXT) also gets a table macro of the same name
+            if self.config.views.sys_context_macros and self.source.dialect == "oracle":
+                try:
+                    macro = translate(as_macro=True)
+                except Exception as e:
+                    self.emit("view_macro_skipped", f"  ⚠️  {name}: no parameterized macro ({e})",
+                              level="warning", view=name)
+                    macro = None
+                if macro:
+                    macros[view.target_key] = macro
 
         created = skipped = 0
         pending = [v for v in plan.views if v.target_key in statements]
@@ -425,7 +439,8 @@ class Replicator:
             for view in pending:
                 name = view.source.qualified_name
                 sql = statements[view.target_key]
-                definition_hash = hashlib.sha256(sql.encode()).hexdigest()
+                macro = macros.get(view.target_key)
+                definition_hash = hashlib.sha256((sql + ("\n" + macro if macro else "")).encode()).hexdigest()
                 full = self.options.full_refresh or self.config.refresh.mode == "full"
                 # Same definition as last time AND still valid: a table it reads may have changed shape
                 # (e.g. a column newly excluded), which leaves an unchanged view broken.
@@ -445,6 +460,18 @@ class Replicator:
                     failures[name] = str(e)
                     remaining.append(view)
                     continue
+                if macro:
+                    try:
+                        self.target.execute(conn=target_conn, sql=macro)
+                        target_conn.commit()
+                        self.emit("view_macro_created", f"  🧩 {view.target_db_schema}.{view.target_view}(...): "
+                                  "table macro for the parameterized view", view=name)
+                    except Exception as e:
+                        with suppress(Exception):
+                            target_conn.rollback()
+                        self.emit("view_macro_skipped", f"  ⚠️  {name}: parameterized macro failed: "
+                                  f"{str(e).splitlines()[0][:200]}", level="warning", view=name)
+                        definition_hash = hashlib.sha256(sql.encode()).hexdigest()    # retried next run
                 store.save_view(db_schema=view.target_db_schema, view=view.target_view,
                                 definition_hash=definition_hash, run_id=run_id)
                 store.record_object(run_id=run_id, kind="view", source_name=name, db_schema=view.target_db_schema,
@@ -491,6 +518,10 @@ class Replicator:
                     target_conn.commit()
                     self.emit("view_dropped", f"  🗑️  {view.target_db_schema}.{view.target_view}: dropped the "
                               "previous version (it couldn't be recreated)", level="warning", view=name)
+            with suppress(Exception):           # its parameterized macro, if it had one
+                self.target.drop(conn=target_conn, db_schema=view.target_db_schema, name=view.target_view,
+                                 kind="MACRO TABLE")
+                target_conn.commit()
             with suppress(Exception):
                 store.forget_view(db_schema=view.target_db_schema, view=view.target_view)
             store.record_object(run_id=run_id, kind="view", source_name=name, db_schema=view.target_db_schema,
