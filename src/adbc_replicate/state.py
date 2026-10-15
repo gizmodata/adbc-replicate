@@ -147,6 +147,10 @@ class StateStore:
         self.conn.commit()
         return {(r[0], r[1]): r[2] for r in rows}
 
+    def forget_view(self, db_schema: str, view: str) -> None:
+        self._exec(f"DELETE FROM {self.s}.view_state WHERE db_schema_name = ? AND view_name = ?", [db_schema, view])
+        self.conn.commit()
+
     def save_view(self, db_schema: str, view: str, definition_hash: str, run_id: str) -> None:
         self._exec(f"DELETE FROM {self.s}.view_state WHERE db_schema_name = ? AND view_name = ?", [db_schema, view])
         self._exec(f"INSERT INTO {self.s}.view_state VALUES (?, ?, ?, ?, ?)",

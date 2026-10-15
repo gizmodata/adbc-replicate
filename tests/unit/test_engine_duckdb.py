@@ -512,3 +512,25 @@ def test_incremental_mode_falls_back_where_the_source_cannot_track_changes(paths
     assert summary.exit_code == EXIT_OK and summary.stats["tables_copied"] == 2, out
     summary, out = run(config=config, skip_views=True)
     assert summary.stats["tables_copied"] == 0 and "unchanged (fingerprint" in out, out
+
+
+def test_views_that_no_longer_bind_are_dropped_not_left_broken(paths):
+    """Found on a real run: excluding a column (there: BLOBs) that a view reads made the view fail to
+    recreate, while its previous version stayed in the target and the next run called it "unchanged"
+    (same definition hash), so a broken view lingered silently."""
+    summary, out = run(config=make_config(paths=paths))
+    assert target_query(paths=paths, sql="SELECT count(*) FROM duckdb_views() WHERE view_name = 'v_emp'")[0][0] == 1
+
+    without_name = make_config(paths=paths, columns=[{"tables": ["hr.employees"], "exclude": ["notes", "Name"],
+                                                     "mask": {"ssn": {"strategy": "hash", "salt": "pepper"}}}])
+    for _ in range(2):              # the second run used to call the stale view "unchanged"
+        summary, out = run(config=without_name)
+        assert "hr.v_emp" in summary.view_failures, out
+        assert target_query(paths=paths, sql="SELECT count(*) FROM duckdb_views() WHERE view_name IN "
+                                             "('v_emp', 'v_emp_count')")[0][0] == 0, out
+    # every view left in the target works
+    con = duckdb.connect(database=paths["target"], read_only=True)
+    for schema, view in con.execute(query="SELECT schema_name, view_name FROM duckdb_views() WHERE NOT internal "
+                                          "AND schema_name = 'hr'").fetchall():
+        con.execute(query=f'SELECT * FROM "{schema}"."{view}" LIMIT 0')
+    con.close()

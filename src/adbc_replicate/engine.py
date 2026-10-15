@@ -426,7 +426,10 @@ class Replicator:
                 sql = statements[view.target_key]
                 definition_hash = hashlib.sha256(sql.encode()).hexdigest()
                 full = self.options.full_refresh or self.config.refresh.mode == "full"
-                unchanged = view.target_key in existing_views and view_state.get(view.target_key) == definition_hash
+                # Same definition as last time AND still valid: a table it reads may have changed shape
+                # (e.g. a column newly excluded), which leaves an unchanged view broken.
+                unchanged = view.target_key in existing_views and view_state.get(view.target_key) == definition_hash \
+                    and self._view_binds(conn=target_conn, view=view)
                 if not full and unchanged:
                     skipped += 1
                     store.record_object(run_id=run_id, kind="view", source_name=name, db_schema=view.target_db_schema,
@@ -475,11 +478,35 @@ class Replicator:
                 store.record_object(run_id=run_id, kind="view", source_name=name, db_schema=view.target_db_schema,
                                     name=view.target_view, action="materialized", rows=rows)
 
+        by_name = {v.source.qualified_name: v for v in plan.views}
         for name, error in failures.items():
-            view = next(v for v in plan.views if v.source.qualified_name == name)
+            view = by_name[name]
+            # A view that can't be (re)created mustn't linger in the target as an older version that no
+            # longer matches the source (or no longer binds): drop it and forget its state.
+            if view.target_key in existing_views:
+                with suppress(Exception):
+                    self.target.drop(conn=target_conn, db_schema=view.target_db_schema, name=view.target_view,
+                                     kind="VIEW")
+                    target_conn.commit()
+                    self.emit("view_dropped", f"  🗑️  {view.target_db_schema}.{view.target_view}: dropped the "
+                              "previous version (it couldn't be recreated)", level="warning", view=name)
+            with suppress(Exception):
+                store.forget_view(db_schema=view.target_db_schema, view=view.target_view)
             store.record_object(run_id=run_id, kind="view", source_name=name, db_schema=view.target_db_schema,
                                 name=view.target_view, action="failed", error=error)
         return created, skipped, failures
+
+    def _view_binds(self, conn, view: ViewTask) -> bool:
+        """True if the target view still binds (all the tables and columns it reads exist)."""
+        try:
+            self.target.query(conn=conn, sql="SELECT * FROM " + self.target.qualified(
+                db_schema=view.target_db_schema, name=view.target_view) + " LIMIT 0")
+            conn.commit()
+            return True
+        except Exception:
+            with suppress(Exception):
+                conn.rollback()
+            return False
 
     # ---- the run --------------------------------------------------------------------------
 

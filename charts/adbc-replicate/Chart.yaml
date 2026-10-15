@@ -2,8 +2,8 @@ apiVersion: v2
 name: adbc-replicate
 description: Scheduled ADBC-to-ADBC replication into GizmoSQL (a Kubernetes CronJob running adbc-replicate)
 type: application
-version: 0.3.0
-appVersion: "0.3.0"
+version: 0.3.1
+appVersion: "0.3.1"
 home: https://github.com/gizmodata/adbc-replicate
 sources:
   - https://github.com/gizmodata/adbc-replicate

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-14
+
+### Fixed
+
+- A view that couldn't be recreated (e.g. after a column it reads was newly excluded) kept its
+  previous version in the target, and later runs counted it "unchanged" by definition hash, so
+  it stayed broken without being reported. Now a view must also still bind to count as
+  unchanged, and a view that can't be recreated is dropped from the target (and reported).
+  Found on a real 303-view schema, where 19 such views were left behind.
+
 ## [0.3.0] - 2026-10-14
 
 ### Added
