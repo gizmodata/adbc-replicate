@@ -250,7 +250,14 @@ class ViewsConfig(_Model):
         default="fail",
         description="Source-only pseudo-columns that mean nothing in a copy (Oracle ORA_ROWSCN, ROWID), as used "
                     "by APEX views for optimistic locking. fail: report such views. null: keep the column, "
-                    "filled with a typed NULL.",
+                    "filled with a typed NULL; also reads Oracle SYS_CONTEXT(...) as NULL (what Oracle returns "
+                    "when the context isn't set).",
+    )
+    functions: dict[str, str] = Field(
+        default_factory=dict,
+        description="Source functions (e.g. your own PL/SQL) rewritten as DuckDB SQL in translated views: "
+                    "{1}, {2}, ... are the call's arguments by position, {name} a named argument (p_name => x). "
+                    "Package functions are keyed pkg.fn. Example: BOM_FACTOR: \"list_product(...)\".",
     )
 
 

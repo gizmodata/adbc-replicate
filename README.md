@@ -139,7 +139,7 @@ adbc-replicate run --config replicate.yaml
 
 ✨ 2 table(s) to copy, 1 view(s) ready
 
-🚀 adbc-replicate 0.3.1: postgresql → gizmosql (catalog warehouse), run d01f7406-94ea-4517-8dfe-d14ab79b5da3
+🚀 adbc-replicate 0.4.0: postgresql → gizmosql (catalog warehouse), run d01f7406-94ea-4517-8dfe-d14ab79b5da3
 📸 Consistent read: exported snapshot 00000003-00000032-1
 🔍 Discovering source objects…
 🗺️  2 table(s) and 1 view(s) selected (0.0s)
@@ -380,7 +380,13 @@ Views are recreated in the target after the tables, in DuckDB SQL:
 - definitions are read from the source catalog and translated with sqlglot; Oracle `(+)`
   joins become `LEFT JOIN`s, `OUTER/CROSS APPLY` become lateral joins, `FROM DUAL` is dropped,
   `WHERE ROWNUM <= n` becomes `LIMIT n`, and constructs with no faithful translation (e.g.
-  `CONNECT BY`, PL/SQL functions) are reported, never silently changed;
+  PL/SQL functions) are reported, never silently changed;
+- Oracle hierarchical queries (`START WITH` / `CONNECT BY [NOCYCLE]`, `PRIOR`, `LEVEL`,
+  `SYS_CONNECT_BY_PATH`, `CONNECT_BY_ROOT`, `CONNECT_BY_ISLEAF`, `ORDER SIBLINGS BY`, `ROWNUM`
+  as the depth-first row number, `START WITH ... AND ROWNUM = 1` for a single anchor, and
+  `CONNECT BY LEVEL <= n` row generators) become `WITH RECURSIVE` queries;
+  `MIN/MAX(...) KEEP (DENSE_RANK FIRST/LAST ORDER BY ...)` becomes `min_by`/`max_by`; `INSTR`
+  with a start position (also negative: searching backward) or an occurrence is computed exactly;
 - Oracle date semantics are kept: `CAST(x AS DATE)` keeps the time of day, `TRUNC(date)` and
   `TRUNC(date, 'MM')` become `DATE_TRUNC`, and `TO_CHAR` formats with an exact DuckDB
   equivalent (`YYYYMMDD`, `HH24:MI`, `DAY`, `fm0000000`, `fm999,990`, ...) are rewritten; the
@@ -398,11 +404,21 @@ views:
   overrides_dir: ./view-overrides    # <DB_SCHEMA>.<VIEW>.sql: your own DuckDB SELECT, used instead
   on_failure: materialize            # or: report (default)
   source_time_zone: America/New_York # the source's clock, for SYSDATE & co (Oracle)
-  source_pseudo_columns: "null"      # Oracle ORA_ROWSCN / ROWID in views: fail (default) | null
+  source_pseudo_columns: "null"      # Oracle ORA_ROWSCN / ROWID / SYS_CONTEXT(...) in views: fail (default) | null
+  functions:                         # your own source functions (e.g. PL/SQL), as DuckDB SQL
+    # {1}, {2}, ... are the call's arguments by position, {p_name} a named one (p_name => x);
+    # package functions are keyed PKG.FN
+    BOM_FACTOR: >-
+      CAST(coalesce(list_product(list_transform(string_split(substring({1}, 2), '/'),
+      lambda q: coalesce(CAST(NULLIF(q, '') AS DOUBLE), 1))), 1) AS DECIMAL(38,10))
 ```
 
-A view that calls a source-only function (PL/SQL, `SYS_CONTEXT`) can't be translated; list it
-in `objects[].materialize_views` to copy its rows instead (column rules still apply).
+`SYS_CONTEXT(...)` reads as NULL with `source_pseudo_columns: "null"`: what Oracle returns in a
+session that set no context, so "parameterized views" behave as if no parameter was passed.
+
+A view that calls any other source-only function can't be translated: rewrite the function in
+`views.functions`, or list the view in `objects[].materialize_views` to copy its rows instead
+(column rules still apply).
 
 ### Notifications: Slack or any webhook
 
@@ -475,7 +491,9 @@ objects:
 - Global temporary tables are skipped (their rows are private to the session that wrote
   them). External tables are copied like tables but read as they are now, since files have no
   SCN; `external_tables: exclude` leaves them out. `BFILE` columns (pointers to files on the
-  database server) can't be read and are skipped; the plan lists them.
+  database server) can't be read, and `LONG` / `LONG RAW` columns (deprecated; Oracle can't use
+  them in expressions) aren't copied either: they are skipped, and the plan lists them. To keep a
+  `BLOB` column without its bytes (so views selecting it still work), mask it: `"null"`.
 - On 23ai and later, `GRANT SELECT ANY TABLE ON SCHEMA ERP` and `GRANT FLASHBACK ANY TABLE ON
   SCHEMA ERP` cover every current and future table in a schema.
 - Any `adbc.oracle.*` driver option (TLS, wallets, NNE, batch sizes) goes in `options`.

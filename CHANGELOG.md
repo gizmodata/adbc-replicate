@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-15
+
+### Added
+
+- Oracle hierarchical queries in views (`START WITH` / `CONNECT BY [NOCYCLE]`, `PRIOR`, `LEVEL`,
+  `SYS_CONNECT_BY_PATH`, `CONNECT_BY_ROOT`, `CONNECT_BY_ISLEAF`, `ORDER SIBLINGS BY`, `ROWNUM` as
+  the depth-first row number, `START WITH ... AND ROWNUM = 1`, `CONNECT BY LEVEL <= n`) are
+  translated to `WITH RECURSIVE`. Cycles stop where Oracle's NOCYCLE stops (a row repeating an
+  ancestor's PRIOR values) instead of recursing forever.
+- `MIN/MAX(x) KEEP (DENSE_RANK FIRST/LAST ORDER BY ...)`, aggregate and analytic, becomes
+  `min_by`/`max_by` over a `create_sort_key` of the sort keys plus `x` (ties take the MIN/MAX of
+  `x`, as in Oracle; any ASC/DESC/NULLS order).
+- `INSTR(s, sub, position, occurrence)` is translated exactly: Nth occurrence, overlapping
+  matches, backward search from a negative position, NULLs.
+- `SYS_CONTEXT(...)` reads as NULL with `views.source_pseudo_columns: "null"` (what Oracle returns
+  when the context isn't set), and `TO_DATE`/`TO_TIMESTAMP` of NULL is a typed NULL.
+- `views.functions`: rewrite your own source functions (e.g. PL/SQL) as DuckDB SQL templates,
+  with `{1}`, `{2}`, ... for positional and `{p_name}` for named arguments.
+- Each of these is checked row by row against Oracle in the integration tests. On a real
+  303-view Oracle schema, 45 more views now replicate (217 -> 262).
+
+### Changed
+
+- Oracle `LONG` and `LONG RAW` columns are skipped (and listed in the plan), like `BFILE`.
+
+### Fixed
+
+- `INSTR(s, sub, -1)` (the last occurrence) was translated by sqlglot as a check of the last
+  character only, silently returning wrong positions; and `INSTR(s, sub, 1, 1)` was refused.
+
 ## [0.3.1] - 2026-10-14
 
 ### Fixed

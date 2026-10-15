@@ -18,9 +18,13 @@ _HASHABLE_PREFIXES = ("NUMBER", "FLOAT", "BINARY_FLOAT", "BINARY_DOUBLE", "CHAR"
 _FINGERPRINT_GROUP = 150
 
 
-# Types adbc-driver-oracle can't read; such columns are skipped (and listed in the plan).
+# Types that aren't copied; such columns are skipped (and listed in the plan).
 _UNSUPPORTED_TYPES = {
     "BFILE": "BFILE: a pointer to a file on the database server, not data",
+    # deprecated since Oracle 8i in favour of CLOB/BLOB; Oracle can't use them in expressions
+    # (masks, fingerprints), and a table can have only one
+    "LONG": "LONG: a deprecated type Oracle can't use in expressions",
+    "LONG RAW": "LONG RAW: a deprecated type Oracle can't use in expressions",
 }
 
 class OracleSource(Source):

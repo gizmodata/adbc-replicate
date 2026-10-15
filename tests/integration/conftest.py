@@ -143,7 +143,7 @@ def oracle():
         "CREATE VIEW v_cols (emp_id, emp_name) AS SELECT id, name FROM emp",
         "CREATE VIEW v_on_v AS SELECT dept_name, COUNT(*) AS n FROM v_emp_dept GROUP BY dept_name",
         "CREATE VIEW v_sales AS SELECT o.id, o.amount, e.name FROM sales.orders o JOIN emp e ON e.id = o.emp_id",
-        "CREATE VIEW v_tree AS SELECT LEVEL AS lvl FROM dual CONNECT BY LEVEL <= 3",
+        "CREATE VIEW v_tree AS SELECT LEVEL AS lvl, DUMP(LEVEL) AS bytes FROM dual CONNECT BY LEVEL <= 3",  # DUMP: Oracle-only
     ])
     # Oracle can't flashback-read a table in the first ~2 s after it was created (ORA-01466).
     deadline = time.monotonic() + 30

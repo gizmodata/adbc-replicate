@@ -412,7 +412,8 @@ class Replicator:
                     target_view=view.target_view, name_map=plan.name_map, case=self.config.naming.case,
                     source_columns=[c.name for c in view.source.columns], target_catalog=self.target.catalog,
                     pseudo_columns=self.config.views.source_pseudo_columns,
-                    time_zone=self.config.views.source_time_zone, column_types=plan.column_types)
+                    time_zone=self.config.views.source_time_zone, column_types=plan.column_types,
+                    functions=self.config.views.functions)
             except Exception as e:
                 failures[name] = f"translation: {e}"
 

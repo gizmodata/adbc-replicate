@@ -44,10 +44,15 @@ def ext_source(oracle):
         f"CREATE TABLE {SCHEMA}.documents (id NUMBER(10), title VARCHAR2(50), file_ref BFILE)",
         f"INSERT INTO {SCHEMA}.documents VALUES (1, 'Regions', BFILENAME('ADBC_REPLICATE_EXT', 'adbc_replicate_regions.csv'))",
         f"INSERT INTO {SCHEMA}.documents VALUES (2, 'Nothing', NULL)",
+        f"CREATE TABLE {SCHEMA}.notes (id NUMBER(10), body LONG)",
+        f"INSERT INTO {SCHEMA}.notes VALUES (1, 'a LONG text')",
+        f"CREATE TABLE {SCHEMA}.scans (id NUMBER(10), image LONG RAW)",
+        f"INSERT INTO {SCHEMA}.scans VALUES (1, HEXTORAW('CAFE'))",
         "COMMIT",
         f"GRANT SELECT ON {SCHEMA}.regions_ext TO {ORACLE_USERNAME}",
         f"GRANT SELECT ON {SCHEMA}.documents TO {ORACLE_USERNAME}",
         f"GRANT FLASHBACK ON {SCHEMA}.documents TO {ORACLE_USERNAME}",
+        *[f"GRANT {p} ON {SCHEMA}.{t} TO {ORACLE_USERNAME}" for t in ("notes", "scans") for p in ("SELECT", "FLASHBACK")],
     ])
     system.close()
     # Oracle can't flashback-read a table in the first seconds after it's created (ORA-01466).
@@ -76,17 +81,21 @@ def test_external_table_and_bfile_column_under_snapshot(ext_source, gizmosql, pr
     # BFILE table with "data type BFILE is not supported".
     summary, out = run(config=ext_config(prefix=prefix))
     assert summary.exit_code == EXIT_OK, out
-    assert summary.stats["tables_copied"] == 2, out
+    assert summary.stats["tables_copied"] == 4, out
     assert sorted(query(conn=gizmosql, sql=f"SELECT id, name FROM {prefix}_ext.regions_ext")) == \
         [(1, "North"), (2, "South"), (3, "West")]
     assert [r[0] for r in query(conn=gizmosql, sql=f"DESCRIBE {prefix}_ext.documents")] == ["id", "title"]
     assert "skipping columns that can't be copied: EXTSRC.DOCUMENTS.FILE_REF (BFILE" in out, out
     assert "(excluded FILE_REF)" in out, out
+    # LONG / LONG RAW columns are skipped the same way; the rest of each row is copied
+    for table, column, kind in (("notes", "BODY", "LONG"), ("scans", "IMAGE", "LONG RAW")):
+        assert f"EXTSRC.{table.upper()}.{column} ({kind}:" in out, out
+        assert query(conn=gizmosql, sql=f"SELECT * FROM {prefix}_ext.{table}") == [(1,)]
 
 
 def test_external_tables_can_be_excluded(ext_source, gizmosql, prefix):
     summary, out = run(config=ext_config(prefix=prefix, external_tables="exclude"))
     assert summary.exit_code == EXIT_OK, out
-    assert summary.stats["tables_copied"] == 1, out
-    assert query(conn=gizmosql, sql=f"SELECT table_name FROM duckdb_tables() WHERE schema_name = '{prefix}_ext'") == \
-        [("documents",)]
+    assert summary.stats["tables_copied"] == 3, out
+    assert sorted(query(conn=gizmosql, sql=f"SELECT table_name FROM duckdb_tables() WHERE schema_name = '{prefix}_ext'")) == \
+        [("documents",), ("notes",), ("scans",)]

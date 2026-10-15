@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from adbc_replicate.views import ViewTranslationError, translate_view
@@ -89,7 +91,6 @@ def test_catalog_qualifies_only_ambiguous_names():
 
 @pytest.mark.parametrize("definition", [
     "SELECT TO_CHAR(dt, 'Mon YYYY') AS m FROM emp",                       # sqlglot: CAST(dt AS TEXT)
-    "SELECT INSTR(name, '-', 1, 2) AS p FROM emp",                        # sqlglot: first occurrence
     "SELECT TO_NUMBER(s DEFAULT 0 ON CONVERSION ERROR) AS n FROM emp",   # sqlglot: CAST, raises instead
     "SELECT TO_NUMBER(s, '999D99') AS n FROM emp",
 ])
@@ -147,3 +148,73 @@ def test_oracle_trunc_and_cast_as_date_keep_date_semantics():
     assert "CAST(\"e\".\"hired\" AS TIMESTAMP_S) AS \"c\"" in sql       # not DATE: keeps the time of day
     with pytest.raises(ViewTranslationError, match="TRUNC"):
         ora(definition="SELECT TRUNC(e.hired, 'DY') AS w FROM emp e", column_types=types)
+
+
+def test_instr_position_and_occurrence_are_translated():
+    # Values are checked against Oracle itself in tests/integration/test_oracle_view_functions.py.
+    sql = tr(definition="SELECT INSTR(name, '-', 1, 2) AS a, INSTR(name, '/', -1) AS b, INSTR(name, '-') AS c FROM emp")
+    assert "LIST_FILTER" in sql and "LIST_REVERSE" in sql and 'STRPOS("name", \'-\') AS "c"' in sql
+    assert "SUBSTRING(\"name\", -1)" not in sql          # sqlglot's translation of a negative position
+    with pytest.raises(ViewTranslationError, match="ORA-01428"):
+        tr(definition="SELECT INSTR(name, '-', 1, 0) AS a FROM emp")
+
+
+def test_keep_dense_rank_becomes_min_by_max_by():
+    sql = tr(definition="SELECT g, MIN(x) KEEP (DENSE_RANK FIRST ORDER BY k, k2 DESC) AS a, "
+                        "MAX(x) KEEP (DENSE_RANK LAST ORDER BY k) OVER (PARTITION BY g) AS b FROM t GROUP BY g, x, k")
+    sql = re.sub(r"\s+\)", ")", re.sub(r"\(\s+", "(", " ".join(sql.split())))     # pretty-printing aside
+    assert ('MIN_BY("x", CREATE_SORT_KEY("k", \'ASC NULLS LAST\', "k2", \'DESC NULLS FIRST\', "x", '
+            '\'ASC NULLS LAST\')) AS "a"') in sql
+    assert ('MAX_BY("x", CREATE_SORT_KEY("k", \'ASC NULLS LAST\', "x", \'ASC NULLS FIRST\')) '
+            'OVER (PARTITION BY "g") AS "b"') in sql
+
+
+def test_keep_with_other_aggregates_is_refused():
+    with pytest.raises(ViewTranslationError, match="MIN and MAX only"):
+        tr(definition="SELECT SUM(x) KEEP (DENSE_RANK FIRST ORDER BY k) AS a FROM t")
+
+
+def test_sys_context_fails_by_default_or_reads_as_null():
+    definition = "SELECT id FROM t WHERE d <= NVL(TO_DATE(SYS_CONTEXT('CTX', 'CUTOFF')), DATE '2026-01-01')"
+    with pytest.raises(ViewTranslationError, match="SYS_CONTEXT"):
+        tr(definition=definition)
+    sql = translate_view(definition=definition, source_dialect="oracle", view_db_schema="HR", target_db_schema="hr",
+                         target_view="v", name_map={}, case="lower", pseudo_columns="null")
+    assert "SYS_CONTEXT" not in sql.upper() and "STRPTIME" not in sql.upper()
+    assert "CAST(NULL AS TIMESTAMP_S)" in sql
+
+
+def test_connect_by_becomes_a_recursive_cte():
+    # Rows are checked against Oracle itself in tests/integration/test_oracle_view_functions.py.
+    sql = tr(definition="SELECT LEVEL AS lvl, SYS_CONNECT_BY_PATH(code, '/') AS path, CONNECT_BY_ROOT id AS root_id, "
+                        "CONNECT_BY_ISLEAF AS leaf, ROWNUM AS seq FROM nodes START WITH parent_id IS NULL "
+                        "AND ROWNUM = 1 CONNECT BY NOCYCLE PRIOR id = parent_id ORDER SIBLINGS BY code")
+    assert sql.count("WITH RECURSIVE") == 1 and "UNION ALL" in sql and "LIMIT 1" in sql
+    assert "CONNECT" not in sql.upper().replace("CONNECT_BY", "") and "PRIOR" not in sql.upper().replace("__CB1_PRIOR", "")
+    assert 'ROW_NUMBER() OVER (ORDER BY "nodes"."__cb_order") AS "seq"' in sql
+
+
+@pytest.mark.parametrize("definition, message", [
+    ("SELECT LEVEL FROM a JOIN b ON a.id = b.id CONNECT BY PRIOR a.id = a.parent_id", "over a join"),
+    ("SELECT * FROM a CONNECT BY PRIOR id = parent_id", r"SELECT \*"),
+    ("SELECT id FROM a WHERE ROWNUM < 3 CONNECT BY PRIOR id = parent_id", "ROWNUM in the WHERE"),
+    ("SELECT id FROM a CONNECT BY id = parent_id", "without PRIOR or LEVEL"),
+])
+def test_connect_by_forms_that_are_refused(definition, message):
+    with pytest.raises(ViewTranslationError, match=message):
+        tr(definition=definition)
+
+
+def test_configured_functions_replace_source_functions():
+    functions = {"bom_factor": "coalesce(list_product(list_transform(string_split(substring({1}, 2), '/'), "
+                                 "lambda v: CAST(NULLIF(v, '') AS DOUBLE))), 1)",
+                 "pkg.fmt": "lpad(CAST({p_value} AS VARCHAR), {p_width}, '0')"}
+    sql = translate_view(definition="SELECT BOM_FACTOR(path) AS f, pkg.fmt(p_width => 6, p_value => id) AS s FROM t",
+                         source_dialect="oracle", view_db_schema="HR", target_db_schema="hr", target_view="v",
+                         name_map={}, case="lower", functions=functions)
+    assert 'LIST_PRODUCT(' in sql and 'SUBSTRING("path", 2)' in sql
+    assert "LPAD(CAST(\"id\" AS TEXT), 6, '0')" in sql and "pkg" not in sql.lower()
+    with pytest.raises(ViewTranslationError, match="doesn't pass"):
+        translate_view(definition="SELECT pkg.fmt(p_value => id) AS s FROM t", source_dialect="oracle",
+                       view_db_schema="HR", target_db_schema="hr", target_view="v", name_map={}, case="lower",
+                       functions=functions)
