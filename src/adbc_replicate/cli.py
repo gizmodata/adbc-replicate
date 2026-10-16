@@ -195,7 +195,7 @@ def plan(config_path, env_file, fmt, show_sql, only) -> None:
                                          time_zone=config.views.source_time_zone,
                                          functions=config.views.functions,
                                          column_renames=the_plan.column_renames,
-                                         column_types=the_plan.column_types,
+                                         column_types=the_plan.column_types, column_names=the_plan.column_names,
                                          excluded_columns=the_plan.excluded_columns)
                     entry["status"] = "translates"
                 if show_sql:

@@ -960,6 +960,12 @@ def _to_date_of_nls_text(value: exp.Expression, fmt: str) -> exp.Expression:
                  value=value, second=exp.CurrentTimestamp(sysdate=True))
 
 
+# where an Oracle '' literal is a value or a comparison operand, so NULL (see _oracle_rewrites)
+_EMPTY_AS_TEXT = (exp.Replace, exp.RegexpReplace, exp.DPipe, exp.Concat, exp.ConcatWs, exp.Anonymous)
+_EMPTY_IS_NULL_PARENTS = (exp.Coalesce, exp.DecodeCase, exp.Alias, exp.Select, exp.Greatest, exp.Least, exp.In,
+                          exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Like, exp.Between)
+
+
 def _oracle_rewrites(body: exp.Expression, pseudo_columns: str = "fail", column_types: dict | None = None,
                      default_schema: str = "", context_params: list[str] | None = None,
                      function_types: dict | None = None) -> exp.Expression:
@@ -970,6 +976,17 @@ def _oracle_rewrites(body: exp.Expression, pseudo_columns: str = "fail", column_
         for operand in (_concat_operands(node=node) if isinstance(node, exp.DPipe) else
                         node.expressions if isinstance(node, exp.Concat) else [node.this]):
             types.of(operand)
+    # '' is NULL in Oracle: as a value (CASE ... THEN '', NVL(x, ''), DECODE, a select item), compared with
+    # (x <> '' is never true) or passed to a function (LENGTH('') is NULL) it becomes a typed NULL. Functions
+    # for which Oracle reads NULL as '' (REPLACE(s, 'x', ''), ||) keep it for the rewrites below.
+    for literal in list(body.find_all(exp.Literal)):
+        if literal.is_string and literal.this == "" and (
+                isinstance(literal.parent, _EMPTY_IS_NULL_PARENTS)
+                or (isinstance(literal.parent, exp.If) and literal.arg_key == "true")
+                or (isinstance(literal.parent, exp.Case) and literal.arg_key == "default")
+                or (isinstance(literal.parent, exp.Nvl2) and literal.arg_key in ("true", "false"))
+                or (isinstance(literal.parent, exp.Func) and not isinstance(literal.parent, _EMPTY_AS_TEXT))):
+            literal.replace(exp.Cast(this=exp.null(), to=exp.DataType.build("VARCHAR")))
     for column in list(body.find_all(exp.Column)):
         name = column.name.upper()
         if name in _ORACLE_PSEUDO_COLUMNS and not column.this.quoted:
@@ -1306,6 +1323,34 @@ def _qualify_without_window(body: exp.Expression) -> None:
         select.where(predicate, copy=False)
 
 
+def _case_sensitive_references(body: exp.Expression, column_names: dict[tuple[str, str], dict[str, str]],
+                                default_schema: str) -> None:
+    """Refuse an unqualified column that matches a column of a table in its own FROM only when case is ignored.
+
+    After normalize_identifiers a reference is spelled as the source database resolves it (Oracle: unquoted
+    partno -> PARTNO). A table created with quoted names ("PartNo") doesn't have that column, so the source
+    resolves the name in an outer query (or fails), while DuckDB, whose names ignore case, would bind it to that
+    table: `partno IN (SELECT partno FROM orderdet)` turns from always-true into a real filter, silently."""
+    for column in body.find_all(exp.Column):
+        if column.table or not isinstance(column.this, exp.Identifier):
+            continue
+        select = column.find_ancestor(exp.Select)
+        if select is None:
+            continue
+        sources = [select.args.get(_FROM).this] if select.args.get(_FROM) is not None else []
+        sources += [join.this for join in select.args.get("joins") or []]
+        for source in sources:
+            if not isinstance(source, exp.Table) or not source.name:
+                continue
+            exact = column_names.get(((source.db or default_schema).upper(), source.name.upper()), {})
+            spelled = exact.get(column.name.lower())
+            if spelled is not None and spelled != column.name and column.name not in exact.values():
+                raise ViewTranslationError(
+                    f"{column.name} doesn't match {source.name}'s column \"{spelled}\" in the source (quoted names "
+                    "are case-sensitive there), so the source resolves it elsewhere (an outer query); in the target "
+                    "it would match that column. Add a view override that says which one is meant")
+
+
 def translate_view(definition: str, source_dialect: str, view_db_schema: str, target_db_schema: str,
                    target_view: str, name_map: dict[tuple[str, str], tuple[str, str]], case: str,
                    source_columns: list[str] | None = None, target_catalog: str | None = None,
@@ -1314,6 +1359,7 @@ def translate_view(definition: str, source_dialect: str, view_db_schema: str, ta
                    functions: dict[str, str] | None = None,
                    column_renames: dict[tuple[str, str], dict[str, str]] | None = None,
                    excluded_columns: dict[tuple[str, str], set[str]] | None = None,
+                   column_names: dict[tuple[str, str], dict[str, str]] | None = None,
                    as_macro: bool = False) -> str | None:
     """Return a DuckDB-dialect CREATE OR REPLACE VIEW for a source view definition.
 
@@ -1348,6 +1394,8 @@ def translate_view(definition: str, source_dialect: str, view_db_schema: str, ta
         raise ViewTranslationError("the view definition isn't a query")
 
     body = normalize_identifiers(body, dialect=source_dialect)
+    if column_names:
+        _case_sensitive_references(body=body, column_names=column_names, default_schema=view_db_schema)
     function_types = _function_types(functions=functions or {})
     if column_renames:
         _rename_columns(body=body, renames=column_renames, default_schema=view_db_schema,

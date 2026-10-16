@@ -483,6 +483,7 @@ class Replicator:
                     source_columns=[c.name for c in view.source.columns], target_catalog=self.target.catalog,
                     pseudo_columns=self.config.views.source_pseudo_columns,
                     time_zone=self.config.views.source_time_zone, column_types=plan.column_types,
+                    column_names=plan.column_names,
                     functions=self.config.views.functions, column_renames=plan.column_renames,
                     excluded_columns=plan.excluded_columns)
                 statements[view.target_key] = translate()

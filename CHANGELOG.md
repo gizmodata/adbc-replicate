@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-16
+
+### Fixed
+
+- Oracle views: an empty string literal is NULL, as it is in Oracle, wherever it is a value (`CASE ... THEN ''`,
+  `NVL(x, '')`, `DECODE`, a select item), compared with (`x <> ''` is never true) or passed to a function
+  (`LENGTH('')` is NULL). It stayed an empty string, so e.g. a `CASE` returning `''` gave non-NULL values
+  where Oracle has NULLs. `REPLACE`, `REGEXP_REPLACE` and `||`, which read NULL as `''`, behave as before.
+
+- Views: a column reference that matches a column of a table in its own `FROM` only when case is ignored
+  is refused (the view is listed as failed, with the reason). Oracle and Snowflake fold an unquoted
+  `partno` to `PARTNO`, which doesn't match a quoted `"PartNo"` column, so they resolve it in an outer
+  query; DuckDB names ignore case, so the copied view would bind it to that table and filter differently
+  without any error. Add a view override that says which column is meant.
+
 ## [0.5.1] - 2026-10-16
 
 ### Fixed

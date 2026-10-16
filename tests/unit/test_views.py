@@ -210,6 +210,18 @@ def test_greatest_and_least_are_null_when_any_argument_is():
     assert sql.count("CASE WHEN") == 4 and 'GREATEST("a") AS "one"' in sql
 
 
+def test_reference_matching_a_quoted_column_only_without_case_is_refused():
+    names = {("HR", "ORDERDET"): {"partno": "PartNo"}, ("HR", "ESTIM"): {"partno": "PARTNO"}}
+    with pytest.raises(ViewTranslationError, match="doesn't match ORDERDET's column \"PartNo\""):
+        translate_view(definition="SELECT partno FROM estim WHERE partno IN (SELECT partno FROM orderdet)",
+                       source_dialect="oracle", view_db_schema="HR", target_db_schema="hr", target_view="v",
+                       name_map={}, case="lower", column_names=names)
+    for definition in ("SELECT partno FROM estim WHERE partno IN (SELECT \"PartNo\" FROM orderdet)",
+                       "SELECT e.partno FROM estim e WHERE e.partno IN (SELECT o.\"PartNo\" FROM orderdet o)"):
+        assert translate_view(definition=definition, source_dialect="oracle", view_db_schema="HR",
+                              target_db_schema="hr", target_view="v", name_map={}, case="lower", column_names=names)
+
+
 def test_connect_by_becomes_a_recursive_cte():
     # Rows are checked against Oracle itself in tests/integration/test_oracle_view_functions.py.
     sql = tr(definition="SELECT LEVEL AS lvl, SYS_CONNECT_BY_PATH(code, '/') AS path, CONNECT_BY_ROOT id AS root_id, "

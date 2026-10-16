@@ -269,6 +269,7 @@ def build_plan(config: ReplicationConfig, source, conn) -> Plan:
         for obj in objects:
             plan.column_types[(obj.db_schema.upper(), obj.name.upper())] = {
                 c.name.upper(): c.data_type for c in obj.columns}
+            plan.column_names[(obj.db_schema.upper(), obj.name.upper())] = {c.name.lower(): c.name for c in obj.columns}
     if plan.views and config.views.source_time_zone:
         warning = source.time_zone_warning(conn=conn, time_zone=config.views.source_time_zone)
         if warning:

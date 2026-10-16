@@ -349,6 +349,31 @@ def test_connect_by_matches_oracle(oracle, gizmosql, prefix):
     assert not mismatches, "\n".join(mismatches)
 
 
+def test_unquoted_name_of_a_quoted_column_is_refused(oracle, gizmosql, prefix):
+    """ORDERDET has a quoted column "PartNo". Oracle resolves an unquoted partno in a subquery over it to the outer
+    query (so the IN is always true); lower-cased in the target it would match orderdet.partno. The translation
+    must refuse that view, and translate the quoted reference ("PartNo"), which means the same in both."""
+    schema = f"{prefix}_qc"
+    data = ("WITH orderdet AS (SELECT CAST('A' AS VARCHAR2(5)) AS \"PartNo\" FROM dual), "
+            "estim AS (SELECT CAST('A' AS VARCHAR2(5)) AS partno FROM dual UNION ALL SELECT 'B' FROM dual) ")
+    unquoted = "SELECT partno FROM estim WHERE partno IN (SELECT partno FROM orderdet)"
+    quoted = "SELECT partno FROM estim WHERE partno IN (SELECT \"PartNo\" FROM orderdet)"
+    assert sorted(r[0] for r in query(conn=oracle, sql=data + unquoted)) == ["A", "B"]   # resolved to estim.partno
+    assert [r[0] for r in query(conn=oracle, sql=data + quoted)] == ["A"]
+    query(conn=gizmosql, sql=f"CREATE SCHEMA {schema}")
+    query(conn=gizmosql, sql=f"CREATE TABLE {schema}.orderdet AS SELECT 'A' AS partno")
+    query(conn=gizmosql, sql=f"CREATE TABLE {schema}.estim AS SELECT * FROM (VALUES ('A'), ('B')) AS v(partno)")
+    names = {(schema.upper(), "ORDERDET"): {"partno": "PartNo"}, (schema.upper(), "ESTIM"): {"partno": "PARTNO"}}
+    with pytest.raises(ViewTranslationError, match="doesn't match ORDERDET's column \"PartNo\""):
+        translate_view(definition=unquoted, source_dialect="oracle", view_db_schema=schema.upper(),
+                       target_db_schema=schema, target_view="v_unquoted", name_map={}, case="lower",
+                       column_names=names)
+    sql = translate_view(definition=quoted, source_dialect="oracle", view_db_schema=schema.upper(),
+                         target_db_schema=schema, target_view="v_quoted", name_map={}, case="lower", column_names=names)
+    query(conn=gizmosql, sql=sql)
+    assert [r[0] for r in query(conn=gizmosql, sql=f"SELECT partno FROM {schema}.v_quoted")] == ["A"]
+
+
 def test_connect_by_nocycle_matches_oracle(oracle, gizmosql, prefix):
     """Parts 2 and 3 contain each other: NOCYCLE stops where a row would be its own ancestor."""
     schema = f"{prefix}_cy"
@@ -402,6 +427,12 @@ EXPRESSION_CASES = [
     # GREATEST / LEAST: NULL when any argument is NULL
     "GREATEST(n, n2)", "LEAST(i, n2, n)", "GREATEST(n, NULL)", "LEAST(z0, n, NULL)", "GREATEST(s, z)",
     "TO_CHAR(GREATEST(d, d2), 'YYYY-MM-DD')", "NVL(TO_CHAR(LEAST(d, NULL)), 'null')", "GREATEST(LEAST(n, n2), i)",
+    # '' is NULL: as a value, compared with, in DECODE (where NULL matches NULL), and as a function argument
+    "CASE WHEN n > 1 THEN '' ELSE 'x' END", "CASE WHEN n > 9 THEN 'x' ELSE '' END", "NVL('', 'd')", "NVL(z, '')",
+    "CASE WHEN s <> '' THEN 'y' ELSE 'n' END", "CASE WHEN s = '' THEN 'y' ELSE 'n' END", "''",
+    "DECODE(i, 42, '', 'x')", "DECODE(z, '', 'was null', 'x')", "NVL2(s, '', 'x')", "NVL2(z, 'x', '')",
+    "CASE WHEN s IN ('', 'Hello World') THEN 'y' END", "CASE WHEN s NOT IN ('', 'x') THEN 'y' ELSE 'n' END",
+    "LENGTH('')", "REPLACE(s, 'l', '')", "NVL(LENGTH(''), -1)",
 ]
 
 

@@ -87,6 +87,9 @@ class Plan:
     # (source db_schema, name) upper-cased -> {column upper-cased: source data type}, for every
     # discovered table and view; lets view translation tell a date from a number.
     column_types: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict)
+    # (source db_schema, name) upper-cased -> {column lower-cased: column name exactly as in the source}; view
+    # translation uses it to find references that match a column only when case is ignored.
+    column_names: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict)
     # (source db_schema, name) upper-cased -> {source column upper-cased: target name}, for columns
     # renamed by column rules; views reading them are re-pointed.
     column_renames: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict)

@@ -80,6 +80,12 @@ charts/adbc-replicate             Helm CronJob
 - Oracle `GREATEST`/`LEAST` are NULL if any argument is; DuckDB's skip NULLs (sqlglot even marks Oracle's
   `ignore_nulls=True`), so they're wrapped in an all-arguments-present CASE. `TO_DATE(TO_CHAR(date), fmt)`
   reads the DD-MON-RR text leniently by field position (`'YYYY-MM-DD'` gives year 16): `_to_date_of_nls_text`.
+- Oracle's `''` is NULL: source `''` literals become `CAST(NULL AS VARCHAR)` as values, comparison operands and
+  function arguments, except where Oracle reads NULL as `''` (REPLACE, REGEXP_REPLACE, `||`) — done on the
+  untouched tree, so the translator's own `''` (nullif templates) is never touched.
+- Names: Oracle/Snowflake fold unquoted names to upper case and quoted ones (`"PartNo"`) keep theirs; DuckDB
+  ignores case. A reference that matches a column only case-insensitively is resolved by the source in an outer
+  query, so `_case_sensitive_references` refuses it (planner passes exact names in `Plan.column_names`).
 - DuckDB 1.5.6 `strftime()` on a `TIMESTAMP_S` before 1677 fails ("Could not convert Timestamp(US) to
   Timestamp(NS)"); cast to `TIMESTAMP` first when formatting dates that may be that old.
 - An audit that runs heavy views on a pico GizmoSQL cluster (1 GB, `memory_limit` 1 GB) can OOM-kill the
