@@ -902,6 +902,64 @@ _TIMESTAMP_LITERAL = re.compile(r"\s*(\d{4}-\d{2}-\d{2}(?: \d{1,2}:\d{2}(?::\d{2
                                 r"\s*([+-]\d{1,2}:\d{2})?\s*")
 
 
+# TO_DATE(TO_CHAR(date), 'format'): TO_CHAR without a format writes NLS_DATE_FORMAT (DD-MON-RR, '16-OCT-26'),
+# and TO_DATE reads it back leniently: fields by position, any separator matching any punctuation, MM accepting
+# a month name, elements after the end of the text ignored. So TO_DATE(TO_CHAR(SYSDATE), 'YYYY-MM-DD') is year
+# 16, October 26 (measured on Oracle 23ai). The element names below: sqlglot's strftime codes, or Oracle's when
+# sqlglot left them as written.
+_NLS_ELEMENTS = {"%d": "day", "DD": "day", "%m": "month", "MM": "month", "%b": "month name", "MON": "month name",
+                 "%B": "month name", "MONTH": "month name", "%Y": "YYYY", "YYYY": "YYYY", "SYYYY": "YYYY",
+                 "%y": "YY", "YY": "YY", "RR": "RR", "RRRR": "RR"}
+_NLS_TRAILING = {"%H", "%I", "%M", "%S", "%p", "AM", "PM", "HH", "HH12", "HH24", "MI", "SS"}
+# the fields of '16-OCT-26': what each holds, as DuckDB SQL over the date (__x__)
+_NLS_FIELDS = [("number", "DAY(__x__)"), ("name", "MONTH(__x__)"), ("number", "(YEAR(__x__) % 100)")]
+
+
+def _to_date_of_nls_text(value: exp.Expression, fmt: str) -> exp.Expression:
+    """TO_DATE(TO_CHAR(value), fmt) for a DATE value, as Oracle evaluates it (see _NLS_ELEMENTS). Raises
+    ViewTranslationError for a format Oracle always rejects for this text, or one this doesn't read exactly."""
+    refuse = ViewTranslationError(f"TO_DATE(TO_CHAR(date), '{fmt}') reads the date's DD-MON-RR text with a format "
+                                  "that has no exact translation here")
+    fields, glued = [], False         # fields: element lists between separators
+    for token, separator in re.findall(r'(S%Y|%[A-Za-z]|"[^"]*"|[A-Za-z0-9]+)|([^A-Za-z0-9%"]+)', fmt):
+        if token.startswith('"'):     # literal text: past the end of the input it is ignored like a separator
+            if len(fields) < 3:
+                raise refuse
+            glued = False
+        elif separator:
+            glued = False
+        elif glued:
+            fields[-1].append(token)
+        else:
+            fields.append([token])
+            glued = True
+    if len(fields) < 3 or any(len(f) > 1 for f in fields[:3]):
+        raise refuse
+    for extra in fields[3:]:          # after the text ends: time of day, AM/PM, quoted literals
+        if not all(t.upper() in _NLS_TRAILING or t in _NLS_TRAILING for t in extra):
+            raise refuse
+    parts = {}
+    for (kind, field), (token,) in zip(_NLS_FIELDS, fields[:3], strict=True):
+        element = _NLS_ELEMENTS.get(token if token.startswith("%") else token.upper().replace("S%Y", "SYYYY"))
+        if element is None or (kind == "name") != (element in ("month", "month name")) \
+                or (kind == "number" and element == "month name"):
+            raise refuse             # Oracle: ORA-01858 / ORA-01843 on every row, or not an element we know
+        role = {"month name": "month", "YYYY": "year", "YY": "year", "RR": "year"}.get(element, element)
+        if role in parts:
+            raise refuse             # ORA-01810 / ORA-01816: an element given twice
+        if element == "YY":          # the current century
+            field = f"(YEAR(__y__) // 100) * 100 + {field}"
+        elif element == "RR":        # the century that puts the year nearest the current one (two-digit RR window)
+            field = (f"CASE WHEN {field} < 50 THEN (YEAR(__y__) // 100 + CASE WHEN YEAR(__y__) % 100 < 50 THEN 0 "
+                     f"ELSE 1 END) * 100 ELSE (YEAR(__y__) // 100 - CASE WHEN YEAR(__y__) % 100 < 50 THEN 1 "
+                     f"ELSE 0 END) * 100 END + {field}")
+        parts[role] = field
+    # MAKE_TIMESTAMP fails on an impossible date (day 31 of a 30-day month), where Oracle raises ORA-01847
+    return _fill(template=f"CAST(MAKE_TIMESTAMP({parts['year']}, {parts['month']}, {parts['day']}, 0, 0, 0) "
+                          "AS TIMESTAMP_S)",
+                 value=value, second=exp.CurrentTimestamp(sysdate=True))
+
+
 def _oracle_rewrites(body: exp.Expression, pseudo_columns: str = "fail", column_types: dict | None = None,
                      default_schema: str = "", context_params: list[str] | None = None,
                      function_types: dict | None = None) -> exp.Expression:
@@ -953,6 +1011,13 @@ def _oracle_rewrites(body: exp.Expression, pseudo_columns: str = "fail", column_
         if _is_null(node=node.this):
             node.replace(exp.Cast(this=exp.null(), to=exp.DataType.build(
                 "TIMESTAMP_S" if isinstance(node, exp.StrToDate) else "TIMESTAMP", dialect="duckdb")))
+
+    # TO_DATE(TO_CHAR(date), 'format'): before TO_CHAR(x) without a format becomes text below
+    for node in list(body.find_all(exp.StrToDate, exp.StrToTime)):
+        inner, fmt = node.this, node.args.get("format")
+        if isinstance(inner, exp.ToChar) and inner.args.get("format") is None and not inner.args.get("nlsparam") \
+                and types.of(inner.this) == "DATE" and isinstance(fmt, exp.Literal) and fmt.is_string:
+            node.replace(_to_date_of_nls_text(value=inner.this, fmt=fmt.this))
 
     _multi_column_unpivots(body=body, types=types, default_schema=default_schema)
     for node in list(body.find_all(exp.StandardHash)):
@@ -1062,6 +1127,13 @@ def _oracle_rewrites(body: exp.Expression, pseudo_columns: str = "fail", column_
     if any(isinstance(c, exp.Column) and c.name.upper() == "ROWNUM" and not c.table
            for c in body.find_all(exp.Column)):
         raise ViewTranslationError("ROWNUM used other than as a top-level 'ROWNUM <= n' (or = 1) filter")
+    # GREATEST / LEAST: NULL if any argument is NULL in Oracle; DuckDB's skip NULLs (and sqlglot marks Oracle's
+    # as ignoring them too), so GREATEST(d, NULL) would be d instead of NULL.
+    for node in sorted(body.find_all(exp.Greatest, exp.Least), key=lambda n: -n.depth):
+        arguments = [node.this, *node.expressions]
+        if len(arguments) > 1:
+            present = exp.and_(*(exp.Not(this=exp.Is(this=a.copy(), expression=exp.null())) for a in arguments))
+            node.replace(exp.Case(ifs=[exp.If(this=present, true=node.copy())]))
     return body
 
 

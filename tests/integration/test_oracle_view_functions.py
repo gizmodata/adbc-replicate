@@ -4,7 +4,7 @@ each expression is evaluated in Oracle, then translated and evaluated in GizmoSQ
 import pytest
 from conftest import query
 
-from adbc_replicate.views import translate_view
+from adbc_replicate.views import ViewTranslationError, translate_view
 
 pytestmark = pytest.mark.integration
 
@@ -57,6 +57,52 @@ def test_date_functions_match_oracle(oracle, gizmosql, prefix):
         actual = query(conn=gizmosql, sql=f"SELECT strftime(r, '%Y-%m-%d %H:%M:%S') FROM {schema}.v{i}")[0][0]
         if actual != expected:
             mismatches.append(f"{expression} on {value}: Oracle {expected!r}, translated {actual!r}")
+    assert not mismatches, "\n".join(mismatches)
+
+
+# TO_DATE(TO_CHAR(x), format): TO_CHAR writes NLS_DATE_FORMAT ('16-OCT-26') and TO_DATE reads it back leniently,
+# by field position. Dates whose two-digit year can't be a day (1975, 2080) fail in Oracle under some formats; the
+# translation must fail there too (on the same rows), not return a value.
+NLS_TEXT_FORMATS = ["YYYY-MM-DD", "DD-MON-RR", "DD-MON-YY", "DD-MON-RRRR", "DD-MON-YYYY", "DD/MM/YY", "DD-MONTH-RR",
+                    "YYYY-MON-DD", "RR-MM-DD", "YY-MM-DD", "RRRR-MM-DD", "SYYYY-MM-DD", "yyyy-mm-dd", "DD.MON.RR",
+                    "DD MON RR", "DD-MON-RR HH24:MI:SS", "YYYY-MM-DD HH24:MI", "DD-MON-RR AM", 'YYYY-MM-DD"T"']
+NLS_TEXT_DATES = ["2026-10-16 14:35:12", "2010-02-05 08:00:00", "2030-09-30 23:59:59", "1975-06-01 00:00:00",
+                  "2080-06-01 12:00:00"]
+# formats Oracle rejects for every DD-MON-RR text; the translation refuses them up front
+NLS_TEXT_ALWAYS_FAIL = ["MM-MON-RR", "DD-MON", "YYYYMMDD", "MON-DD-RR", "DD-DD-RR", "MM-DD-RR", "Y-MM-DD"]
+
+
+def test_to_date_of_default_date_text_matches_oracle(oracle, gizmosql, prefix):
+    schema = f"{prefix}_nt"
+    query(conn=gizmosql, sql=f"CREATE SCHEMA {schema}")
+    types = {(schema.upper(), "T"): {"X": "DATE"}}
+    mismatches = []
+    for i, (fmt, value) in enumerate((f, v) for f in NLS_TEXT_FORMATS for v in NLS_TEXT_DATES):
+        try:
+            expected = query(conn=oracle, sql=f"SELECT TO_CHAR(TO_DATE(TO_CHAR(TO_DATE('{value}', 'YYYY-MM-DD "
+                                              f"HH24:MI:SS')), '{fmt}'), 'SYYYY-MM-DD HH24:MI:SS') FROM dual")[0][0].strip()
+        except Exception:
+            expected = "error"
+        query(conn=gizmosql, sql=f"CREATE OR REPLACE TABLE {schema}.t AS SELECT TIMESTAMP '{value}' AS x")
+        sql = translate_view(definition=f"SELECT TO_DATE(TO_CHAR(x), '{fmt}') AS r FROM t", source_dialect="oracle",
+                             view_db_schema=schema.upper(), target_db_schema=schema, target_view=f"v{i}",
+                             name_map={}, case="lower", column_types=types, time_zone="UTC")
+        query(conn=gizmosql, sql=sql)
+        try:
+            # strftime goes through nanoseconds for TIMESTAMP_S and fails before 1677 (DuckDB 1.5.6); TIMESTAMP doesn't
+            actual = query(conn=gizmosql, sql=f"SELECT lpad(CAST(year(r) AS VARCHAR), 4, '0') || "
+                                              f"strftime(CAST(r AS TIMESTAMP), '-%m-%d %H:%M:%S') FROM {schema}.v{i}")[0][0]
+        except Exception:
+            actual = "error"
+        if actual != expected:
+            mismatches.append(f"'{fmt}' on {value}: Oracle {expected!r}, translated {actual!r}")
+    for fmt in NLS_TEXT_ALWAYS_FAIL:
+        with pytest.raises(Exception, match=r"ORA-018"):
+            query(conn=oracle, sql=f"SELECT TO_DATE(TO_CHAR(SYSDATE), '{fmt}') FROM dual")
+        with pytest.raises(ViewTranslationError, match="reads the date's DD-MON-RR text"):
+            translate_view(definition=f"SELECT TO_DATE(TO_CHAR(x), '{fmt}') AS r FROM t", source_dialect="oracle",
+                           view_db_schema=schema.upper(), target_db_schema=schema, target_view="refused",
+                           name_map={}, case="lower", column_types=types, time_zone="UTC")
     assert not mismatches, "\n".join(mismatches)
 
 
@@ -353,6 +399,9 @@ EXPRESSION_CASES = [
     "AT TIME ZONE 'UTC' AS TIMESTAMP), 'YYYY-MM-DD HH24:MI:SS')",
     "TO_CHAR(CAST(FROM_TZ(CAST(d2 AS TIMESTAMP), 'America/New_York') AT TIME ZONE 'America/Los_Angeles' AS TIMESTAMP), "
     "'YYYY-MM-DD HH24:MI:SS')",
+    # GREATEST / LEAST: NULL when any argument is NULL
+    "GREATEST(n, n2)", "LEAST(i, n2, n)", "GREATEST(n, NULL)", "LEAST(z0, n, NULL)", "GREATEST(s, z)",
+    "TO_CHAR(GREATEST(d, d2), 'YYYY-MM-DD')", "NVL(TO_CHAR(LEAST(d, NULL)), 'null')", "GREATEST(LEAST(n, n2), i)",
 ]
 
 

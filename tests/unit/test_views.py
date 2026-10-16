@@ -184,6 +184,32 @@ def test_sys_context_fails_by_default_or_reads_as_null():
     assert "CAST(NULL AS TIMESTAMP_S)" in sql
 
 
+def test_to_date_of_default_date_text_reads_fields_by_position():
+    # Oracle: TO_DATE(TO_CHAR(SYSDATE), 'YYYY-MM-DD') on 16-OCT-26 is 0016-10-26 (values checked against Oracle in
+    # tests/integration/test_oracle_view_functions.py)
+    sql = translate_view(definition="SELECT TO_DATE(TO_CHAR(SYSDATE), 'YYYY-MM-DD') AS a, "
+                                    "TO_DATE(TO_CHAR(SYSDATE), 'DD-MON-RR') AS b FROM dual",
+                         source_dialect="oracle", view_db_schema="HR", target_db_schema="hr", target_view="v",
+                         name_map={}, case="lower", time_zone="America/New_York")
+    assert "STRPTIME" not in sql.upper() and "STRFTIME" not in sql.upper()
+    assert sql.count("MAKE_TIMESTAMP(") == 2
+
+
+@pytest.mark.parametrize("fmt", ["MM-DD-RR", "DD-MON", "YYYYMMDD", "DD-DD-RR", "fxDD-MON-RR", 'DD"x"MON-RR'])
+def test_to_date_of_default_date_text_refuses_formats_it_cant_read_exactly(fmt):
+    with pytest.raises(ViewTranslationError, match="reads the date's DD-MON-RR text"):
+        translate_view(definition=f"SELECT TO_DATE(TO_CHAR(SYSDATE), '{fmt}') AS a FROM dual", source_dialect="oracle",
+                       view_db_schema="HR", target_db_schema="hr", target_view="v", name_map={}, case="lower",
+                       time_zone="America/New_York")
+
+
+def test_greatest_and_least_are_null_when_any_argument_is():
+    sql = " ".join(tr(definition="SELECT GREATEST(a, b) AS g, LEAST(a, GREATEST(b, c), 1) AS l, GREATEST(a) AS one "
+                                 "FROM t").split())
+    assert 'CASE WHEN NOT "a" IS NULL AND NOT "b" IS NULL THEN GREATEST("a", "b") END AS "g"' in sql
+    assert sql.count("CASE WHEN") == 4 and 'GREATEST("a") AS "one"' in sql
+
+
 def test_connect_by_becomes_a_recursive_cte():
     # Rows are checked against Oracle itself in tests/integration/test_oracle_view_functions.py.
     sql = tr(definition="SELECT LEVEL AS lvl, SYS_CONNECT_BY_PATH(code, '/') AS path, CONNECT_BY_ROOT id AS root_id, "

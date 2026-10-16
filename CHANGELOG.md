@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-16
+
+### Fixed
+
+- Oracle views: `GREATEST` / `LEAST` now return NULL when any argument is NULL, as in Oracle. They
+  were passed through to DuckDB, which skips NULL arguments, so `GREATEST(d, NULL)` returned `d`.
+- Oracle views: `TO_DATE(TO_CHAR(date), 'format')` is translated as Oracle evaluates it. `TO_CHAR`
+  without a format writes `NLS_DATE_FORMAT` (`DD-MON-RR`, e.g. `16-OCT-26`), and `TO_DATE` reads that
+  text back field by field whatever the format says, so `TO_DATE(TO_CHAR(SYSDATE), 'YYYY-MM-DD')` is
+  0016-10-26 in Oracle. The view used to be created and then fail on every query ("Could not parse
+  string \"16-OCT-26\""). Formats Oracle always rejects for that text, or that can't be read exactly,
+  now fail at translation, with the view listed as failed.
+
 ## [0.5.0] - 2026-10-15
 
 ### Added

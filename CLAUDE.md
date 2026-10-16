@@ -77,6 +77,14 @@ charts/adbc-replicate             Helm CronJob
   Oracle's '' is NULL, so string functions' empty results must become NULL; numbers and dates
   turn into text Oracle's way (`_oracle_text`). DuckDB's multi-column UNPIVOT drops a row when any
   value is NULL (Oracle: all), so it's rewritten as UNION ALL.
+- Oracle `GREATEST`/`LEAST` are NULL if any argument is; DuckDB's skip NULLs (sqlglot even marks Oracle's
+  `ignore_nulls=True`), so they're wrapped in an all-arguments-present CASE. `TO_DATE(TO_CHAR(date), fmt)`
+  reads the DD-MON-RR text leniently by field position (`'YYYY-MM-DD'` gives year 16): `_to_date_of_nls_text`.
+- DuckDB 1.5.6 `strftime()` on a `TIMESTAMP_S` before 1677 fails ("Could not convert Timestamp(US) to
+  Timestamp(NS)"); cast to `TIMESTAMP` first when formatting dates that may be that old.
+- An audit that runs heavy views on a pico GizmoSQL cluster (1 GB, `memory_limit` 1 GB) can OOM-kill the
+  server: DuckDB's RSS goes well past `memory_limit`. Reproduce heavy views locally (copy the tables to a DuckDB
+  file, `threads=1`, same `memory_limit`, `/usr/bin/time -l`) instead of on a customer's cluster.
 - GizmoSQL behind nginx: long DuckDB error texts (DuckLake commit failures, view binder errors
   quoting the whole statement) arrive as `RST_STREAM INTERNAL_ERROR` instead of the message.
   Reproduce against a local DuckDB file target (`--row-limit 0`, schema only) to read them.
