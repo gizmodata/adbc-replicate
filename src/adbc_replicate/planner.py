@@ -204,6 +204,7 @@ def build_plan(config: ReplicationConfig, source, conn) -> Plan:
                              f"{winner[0].qualified_name} at {target_db_schema}.{target_name}")
 
     usage = _ColumnRuleUsage(rules=config.columns)
+    lossy: list[str] = []
     unsupported = [f"{obj.qualified_name}.{c.name} ({c.unsupported})"
                    for obj, _, _, _ in by_target.values() for c in obj.columns if c.unsupported]
     if unsupported:
@@ -217,11 +218,16 @@ def build_plan(config: ReplicationConfig, source, conn) -> Plan:
         if len(set(target_names)) != len(target_names):
             raise PlanError(f"{obj.qualified_name}: column names collide after naming.case={case!r}; "
                             "use naming.case: preserve, or exclude one of the columns")
+        unsafe = [(c, reason) for c in columns if c.mask is None
+                  and (reason := source.lossy_type(column=c.column)) is not None]
         if role == "view":
             fallback = TableTask(source=obj, target_db_schema=target_db_schema, target_table=target_name,
                                  columns=columns, excluded_columns=excluded, note="view materialized after a failure")
+            if unsafe and columns and config.views.on_failure == "materialize":
+                plan.warnings.append(f"{obj.qualified_name} won't be materialized if it can't be created as a view: "
+                                     + "; ".join(f"{c.column.name}: {reason}" for c, reason in unsafe))
             plan.views.append(ViewTask(source=obj, target_db_schema=target_db_schema, target_view=target_name,
-                                       columns_task=fallback if columns else None))
+                                       columns_task=fallback if columns and not unsafe else None))
         else:
             if not obj.columns:
                 plan.warnings.append(f"skipping {obj.qualified_name}: the source reported no columns "
@@ -229,6 +235,10 @@ def build_plan(config: ReplicationConfig, source, conn) -> Plan:
                 continue
             if not columns:
                 plan.warnings.append(f"skipping {obj.qualified_name}: every column is excluded")
+                continue
+            if unsafe:
+                lossy.extend(f"{obj.qualified_name}.{c.column.name} ({c.column.data_type}): {reason}"
+                             for c, reason in unsafe)
                 continue
             note = "view materialized as a table" if role == "materialize" else None
             task = TableTask(source=obj, target_db_schema=target_db_schema, target_table=target_name,
@@ -250,6 +260,13 @@ def build_plan(config: ReplicationConfig, source, conn) -> Plan:
         if excluded and role != "view":
             plan.excluded_columns[(obj.db_schema.upper(), obj.name.upper())] = {c.upper() for c in excluded}
 
+    if lossy:
+        raise PlanError(
+            "columns whose values the source driver can't hand over unchanged (they'd be copied wrong, "
+            "with no error):\n  - " + "\n  - ".join(lossy)
+            + "\nCopy each as text with a mask expression, e.g. columns: [{tables: [DB_SCHEMA.TABLE], mask: "
+              "{COLUMN: {strategy: expression, sql: \"CAST({column} AS VARCHAR)\"}}}], or leave it out with "
+              "exclude: [COLUMN].")
     for _, pattern, _ in config_keys:
         if pattern not in used_keys:
             plan.warnings.append(f"refresh.keys pattern {pattern!r} matched no selected table")

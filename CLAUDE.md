@@ -96,3 +96,6 @@ charts/adbc-replicate             Helm CronJob
   Reproduce against a local DuckDB file target (`--row-limit 0`, schema only) to read them.
 - The Snowflake CI user (`ADBC_REPLICATE_CI`) has only PUBLIC: it can read the sample share and
   use SNOWFLAKE_LEARNING_WH, nothing else. Snowflake tests must stay read-only.
+- DuckDB's Arrow export silently changes TIMETZ (drops the offset), BIT and BIGNUM (internal bytes), also
+  nested. `Source.lossy_type()` names such types and the planner refuses them unmasked (`lossy_duckdb_type`
+  matches type names only, never STRUCT field names like `"bit"`).

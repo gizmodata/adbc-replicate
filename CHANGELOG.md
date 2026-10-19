@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- DuckDB source: columns of type `TIMETZ`, `BIT` or `BIGNUM` (alone or nested, e.g. `TIMETZ[]`) are refused
+  at plan time, naming each column, unless they are masked or excluded. DuckDB's Arrow export changed their
+  values without an error: `TIMETZ` arrived as `TIME` without its UTC offset, `BIT` and `BIGNUM` as their
+  internal bytes. Copy them as text with `mask: {COL: {strategy: expression, sql: "CAST({column} AS VARCHAR)"}}`,
+  or exclude them. A view with such a column is no longer materialized by `views.on_failure: materialize`
+  unless it is masked the same way.
+
 ## [0.5.2] - 2026-10-16
 
 ### Fixed

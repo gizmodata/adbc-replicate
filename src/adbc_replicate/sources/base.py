@@ -122,6 +122,11 @@ class Source(ABC):
         """The column as selected when unmasked (plugins add lossless casts here)."""
         return self.quote(name=column.name)
 
+    def lossy_type(self, column: Column) -> str | None:
+        """Why this column's values would change on the way to the target when copied unmasked (the plan
+        refuses it), or None. For types the driver hands over in a form that silently loses data."""
+        return None
+
     def column_expr(self, column: Column, mask: MaskSpec | None) -> str:
         col = self.quote(name=column.name)
         if mask is None:

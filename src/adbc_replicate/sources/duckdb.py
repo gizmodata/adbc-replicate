@@ -5,9 +5,29 @@ Attached databases are catalogs, so objects[].catalog may name any of them.
 
 from __future__ import annotations
 
+import re
+
 from ..config import DuckDBSource as DuckDBConfig
 from ..models import TABLE, VIEW, Column, SourceObject, TableTask
 from .base import Source, in_list, quote_literal
+
+# Types DuckDB's Arrow export can't carry: their values arrive changed, with no error. Matched as a type
+# (alone, or nested: "TIME WITH TIME ZONE[]", "MAP(VARCHAR, BIT)"), never as a STRUCT field name.
+_LOSSY_TYPES = [
+    (re.compile(r"(?:^|[(\s,])TIME WITH TIME ZONE(?=$|[)\[,])"),
+     "TIME WITH TIME ZONE (TIMETZ) arrives as TIME without its UTC offset"),
+    (re.compile(r"(?:^|[(\s,])BIT(?=$|[)\[,])"), "BIT arrives as its internal bytes (BLOB), not its bits"),
+    (re.compile(r"(?:^|[(\s,])(?:BIGNUM|VARINT)(?=$|[)\[,])"),
+     "BIGNUM arrives as its internal bytes (BLOB), not its value"),
+]
+
+
+def lossy_duckdb_type(data_type: str) -> str | None:
+    """Why DuckDB's Arrow export changes values of this type (a duckdb_columns() data_type), or None."""
+    for pattern, reason in _LOSSY_TYPES:
+        if pattern.search(data_type.upper()):
+            return reason
+    return None
 
 
 def duckdb_connect(path: str, read_only: bool = False):
@@ -77,6 +97,9 @@ class DuckDBSource(Source):
         return {(s, n): d for s, n, d in self.fetch_all(conn=conn, sql=(
             f"SELECT schema_name, view_name, sql FROM duckdb_views() WHERE database_name = {db} "
             f"AND schema_name IN ({in_list(values=db_schemas)})"))}
+
+    def lossy_type(self, column: Column) -> str | None:
+        return lossy_duckdb_type(data_type=column.data_type)
 
     def text_expr(self, expr: str) -> str:
         return f"CAST({expr} AS VARCHAR)"

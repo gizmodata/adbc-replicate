@@ -630,6 +630,23 @@ target:
 objects:
   - db_schemas: [main]
 ```
+
+- DuckDB's Arrow export changes three types without an error: `TIMETZ` (`TIME WITH TIME ZONE`) arrives
+  as `TIME` without its UTC offset, and `BIT` and `BIGNUM` arrive as their internal bytes (`BLOB`). So
+  the plan refuses a table with such a column (alone or nested, e.g. `TIMETZ[]`), before anything is
+  copied, and names each column. Copy it as text with a mask expression, or leave it out:
+
+  ```yaml
+  columns:
+    - tables: [main.events]
+      mask:
+        local_time: {strategy: expression, sql: "CAST({column} AS VARCHAR)"}
+      exclude: [flags]
+  ```
+
+  A view with such a column isn't materialized by `views.on_failure: materialize` unless it is masked
+  the same way.
+- `UUID`, `JSON` and `ENUM` arrive as text, `HUGEINT` as `DECIMAL(38,0)`.
 </details>
 
 ## ☸️ Run it on Kubernetes
