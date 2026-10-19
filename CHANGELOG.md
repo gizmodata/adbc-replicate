@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-19
+
 ### Fixed
 
 - DuckDB source: columns of type `TIMETZ`, `BIT` or `BIGNUM` (alone or nested, e.g. `TIMETZ[]`) are refused
