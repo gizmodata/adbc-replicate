@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or exclude them. A view with such a column is no longer materialized by `views.on_failure: materialize`
   unless it is masked the same way.
 
+- DuckDB source: tables and views in a DuckDB file's `main` schema were never listed, so `db_schemas: [main]`
+  copied nothing (the plan only warned that the pattern matched no db_schema). DuckDB flags `main` as an
+  internal schema, like `information_schema`, and internal schemas were left out.
+
 ## [0.5.2] - 2026-10-16
 
 ### Fixed

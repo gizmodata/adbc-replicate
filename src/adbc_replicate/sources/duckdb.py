@@ -63,9 +63,11 @@ class DuckDBSource(Source):
 
     def list_db_schemas(self, conn, catalog: str | None) -> list[str]:
         db = quote_literal(value=self._catalog(conn=conn, catalog=catalog))
+        # DuckDB flags every database's default schema `main` as internal, like information_schema and
+        # pg_catalog; it holds user tables, so it is listed.
         return [r[0] for r in self.fetch_all(conn=conn, sql=(
-            f"SELECT schema_name FROM duckdb_schemas() WHERE database_name = {db} AND NOT internal "
-            "ORDER BY schema_name"))]
+            f"SELECT schema_name FROM duckdb_schemas() WHERE database_name = {db} "
+            "AND (NOT internal OR schema_name = 'main') ORDER BY schema_name"))]
 
     def list_objects(self, conn, catalog: str | None, db_schemas: list[str]) -> list[SourceObject]:
         db = quote_literal(value=self._catalog(conn=conn, catalog=catalog))

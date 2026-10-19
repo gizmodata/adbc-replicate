@@ -630,3 +630,24 @@ def test_watermark_starts_from_state_left_by_a_changed_mode_run(paths):
                                  "WHERE id = 7")
     summary, out = run(config=config)
     assert summary.stats["tables_merged"] == 1 and summary.stats["tables_copied"] == 0, out
+
+
+def test_tables_in_the_main_schema_are_copied(paths):
+    """DuckDB flags a database's `main` schema as internal (like information_schema), and the source used to
+    drop internal schemas, so `db_schemas: [main]` copied nothing, with only a warning."""
+    source_exec(paths=paths, sql="CREATE TABLE main.items AS SELECT i AS id FROM range(1, 11) t(i); "
+                                 "CREATE VIEW main.v_items AS SELECT count(*) AS n FROM main.items")
+    config = make_config(paths=paths, objects=[{"db_schemas": ["main"]}], columns=[])
+    summary, out = run(config=config)
+    assert summary.exit_code == EXIT_OK and summary.stats["tables_copied"] == 1, out
+    assert "matched no db_schema" not in out, out
+    assert target_query(paths=paths, sql="SELECT count(*) FROM main.items")[0][0] == 10
+    assert target_query(paths=paths, sql="SELECT n FROM main.v_items")[0][0] == 10
+    # the other internal schemas stay out; user schemas stay in
+    from adbc_replicate.sources import make_source
+    source = make_source(config=config.source)
+    conn = source.connect()
+    try:
+        assert source.list_db_schemas(conn=conn, catalog=None) == ["hr", "main", "staging"]
+    finally:
+        conn.close()
