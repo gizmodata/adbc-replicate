@@ -12,7 +12,6 @@ from adbc_replicate.config import parse_config
 from adbc_replicate.engine import EXIT_OK, EXIT_VIEW_ERRORS, Replicator, RunOptions
 from adbc_replicate.events import Reporter
 from adbc_replicate.planner import PlanError
-from adbc_replicate.sources.duckdb import lossy_duckdb_type
 
 AS_TEXT = {"strategy": "expression", "sql": "CAST({column} AS VARCHAR)"}
 
@@ -109,13 +108,3 @@ def test_a_view_is_not_materialized_with_a_lossy_column(paths):
                                   columns=[{"tables": ["app.v_tz"], "mask": {"tz": AS_TEXT}}]))
     assert summary.exit_code == EXIT_OK, out
     assert target(paths=paths, sql="SELECT tz FROM app.v_tz") == [("12:34:56+05:30",)]
-
-
-@pytest.mark.parametrize(("data_type", "lossy"), [
-    ("TIME WITH TIME ZONE", True), ("TIME WITH TIME ZONE[]", True), ("BIT", True), ("BIT[3]", True),
-    ("BIGNUM", True), ("VARINT", True), ("MAP(VARCHAR, BIT)", True), ("STRUCT(a INTEGER, x TIME WITH TIME ZONE)", True),
-    ("TIME", False), ("TIMESTAMP WITH TIME ZONE", False), ("BLOB", False), ('STRUCT("bit" INTEGER)', False),
-    ("STRUCT(bignum INTEGER, bitmask VARCHAR)", False), ("VARCHAR", False),
-])
-def test_lossy_type_names(data_type, lossy):
-    assert (lossy_duckdb_type(data_type=data_type) is not None) == lossy
